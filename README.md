@@ -75,6 +75,9 @@ hooks/
   check-types.sh         PostToolUse: tsc --noEmit on the edited file's package
   check-type-dup.sh      PostToolUse: flags inline domain types in apps/ when the
                          monorepo has packages/ (reuse packages/shared instead)
+  learn-on-stop.sh       Stop: before the session ends, has the model record
+                         non-obvious learnings to ~/.claude/learnings/<project>.md
+                         — personal, machine-local data; never committed or shared
 bin/
   team-init              plants the required|optional marker in a project repo
 ```
