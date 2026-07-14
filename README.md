@@ -76,11 +76,12 @@ hooks/
   check-type-dup.sh      PostToolUse: flags inline domain types in apps/ when the
                          monorepo has packages/ (reuse packages/shared instead)
   learn-on-stop.sh       Stop: before the session ends, has the model record
-                         non-obvious learnings to ~/.claude/learnings/<project>.md
-                         — personal, machine-local data; never committed or shared
-  learn-recall.sh        SessionStart: injects an index of this project's personal
-                         learnings (heading lines only) with an instruction to Read
-                         the matching entry before related work; small files whole
+                         non-obvious learnings to ~/.claude/learnings/<project>.md,
+                         classified as Rules (generally applicable) or Episodes
+                         (incident records) — personal, machine-local, never shared
+  learn-recall.sh        SessionStart: injects Rules in full (standing knowledge,
+                         no matching needed) + an index of Episode headings with an
+                         instruction to Read the matching entry before related work
 bin/
   team-init              plants the required|optional marker in a project repo
 ```

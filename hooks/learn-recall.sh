@@ -1,10 +1,13 @@
 #!/bin/sh
 # SessionStart hook — the READ path of the learning loop.
-# Injects an INDEX (the "## " heading lines) of this project's personal
-# learnings (~/.claude/learnings/<repo>.md, written by learn-on-stop.sh) into
-# the new session's context, plus a standing instruction to Read the relevant
-# section before starting related work. Small files are injected whole —
-# an index would cost more than it saves.
+# The learnings file (~/.claude/learnings/<repo>.md, written by
+# learn-on-stop.sh) has two tiers, injected differently:
+#   # Rules    → injected IN FULL every session (standing knowledge that
+#                applies to all work — no relevance matching needed)
+#   # Episodes → only "## " heading lines as an index, plus a standing
+#                instruction to Read the matching entry before related work
+# Small files are injected whole — an index would cost more than it saves.
+# Files without section headers are treated as all-episodes (legacy format).
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # The heredoc below occupies stdin, so hand the hook payload to python via env.
@@ -47,20 +50,44 @@ if len(text) <= FULL_TEXT_MAX:
     )
     sys.exit(0)
 
-# Large file: inject only the index (heading lines). The model reads the
-# full entry on demand, at the moment a related request actually arrives.
-headings = [ln for ln in text.splitlines() if ln.startswith("## ")]
-if not headings:
-    sys.exit(0)
+# Large file: two-tier injection.
+# Rules = everything between a "# Rules" line and the next level-1 header.
+lines = text.splitlines()
+rules, in_rules = [], False
+for ln in lines:
+    if ln.strip() == "# Rules":
+        in_rules = True
+        continue
+    if in_rules and ln.startswith("# ") and not ln.startswith("## "):
+        in_rules = False
+    if in_rules:
+        rules.append(ln)
+rules_text = "\n".join(rules).strip()
+
+headings = [ln for ln in lines if ln.startswith("## ")]
 index = "\n".join(f"- {h[3:].strip()}" for h in headings)
 
+if not rules_text and not headings:
+    sys.exit(0)
+
+parts = []
+if rules_text:
+    parts.append(
+        "STANDING RULES for this project — these apply to ALL work this "
+        "session, whatever the task:\n\n" + rules_text
+    )
+if headings:
+    parts.append(
+        "Index of past episode learnings. BEFORE starting any work related "
+        f"to one of these topics, Read {path} and apply the matching "
+        "entry:\n\n" + index
+    )
+
+body = "\n\n".join(parts)
 print(
-    f'<personal-learnings-index project="{name}" source="{path}">\n'
-    "Index of your learnings from past sessions in this project. "
-    f"BEFORE starting any work related to one of these topics, Read {path} "
-    "and apply the matching entry. This content is personal machine-local "
-    "memory — never commit or share it.\n\n"
-    f"{index}\n"
-    "</personal-learnings-index>"
+    f'<personal-learnings project="{name}" source="{path}">\n'
+    f"{body}\n\n"
+    "This content is personal machine-local memory — never commit or share it.\n"
+    "</personal-learnings>"
 )
 PY

@@ -48,22 +48,38 @@ except OSError:
 reason = (
     "Before ending this session: if it produced NON-OBVIOUS learnings — gotchas, "
     "debugging insights, project quirks, corrections the user gave you, decisions "
-    f"and their reasons — append them to {target} in this format:\n\n"
+    f"and their reasons — record them in {target}. The file has two sections; "
+    "CLASSIFY each learning before writing it:\n\n"
+    "1. '# Rules' — knowledge that applies to future work in this project "
+    "GENERALLY: conventions, specs, policies, always/never constraints. The test: "
+    "would this still apply when building a completely different feature? If yes, "
+    "it is a rule. Write it as ONE distilled, dateless bullet and merge it into "
+    "the existing # Rules section (fold into an existing rule if it overlaps; "
+    "keep the section under ~20 bullets by consolidating). Rules span every "
+    'domain — examples: "API error responses always use {code, message}" / '
+    '"DB migrations run in filename date-prefix order; a wrong prefix is '
+    'silently skipped" / "check a CI workflow file\'s git log before editing '
+    'it" / "all UI follows the mobile spec: z-index layers + breakpoints" / '
+    '"external API calls go through the shared retry wrapper".\n\n'
+    "2. '# Episodes' — the record of a specific incident or debugging story. "
+    "Append under # Episodes as:\n"
     "## <YYYY-MM-DD> — <specific, searchable topic>\n"
-    "- <one concise bullet per learning>\n\n"
-    "The heading is load-bearing: future sessions see ONLY the heading lines as an "
-    "index and decide from them whether to read the entry, so a vague heading makes "
-    "the entry unfindable. Name the concrete system/file/feature and the symptom. "
-    'Bad: "## 2026-07-14 — bug fix". '
-    'Good: "## 2026-07-14 — Railway healthcheck path misconfig causes restart loop".\n\n'
-    "Rules: only non-obvious items (skip anything derivable from the code, docs, or "
-    "git history); write for your future self months from now; read the file first "
-    "and do not duplicate entries that are already there. If the file has grown past "
-    "~150 lines, consolidate it while you're there: merge overlapping entries and "
-    "drop ones that are now obsolete. This file is the user's personal machine-local "
-    "memory — never commit it or copy it into a repo. "
-    "If this session genuinely produced nothing worth recording, write nothing and "
-    "simply end."
+    "- <one concise bullet per learning>\n"
+    "Episode headings are load-bearing: future sessions see ONLY the heading "
+    "lines as an index and decide from them whether to read the entry — name the "
+    'concrete system/file/symptom. Bad: "## 2026-07-14 — bug fix". Good: '
+    '"## 2026-07-14 — Railway healthcheck path misconfig causes restart loop". '
+    "(This heading rule applies to episodes only.)\n\n"
+    "If the file is new or lacks these sections, create the '# Rules' / "
+    "'# Episodes' structure. Read the file first and do not duplicate what is "
+    "already there. If the file has grown past ~150 lines, consolidate while "
+    "you're there: merge overlapping entries, drop obsolete ones, and PROMOTE "
+    "lessons that recur across episodes into # Rules. Only record non-obvious "
+    "items (skip anything derivable from the code, docs, or git history); write "
+    "for your future self months from now. This file is the user's personal "
+    "machine-local memory — never commit it or copy it into a repo. "
+    "If this session genuinely produced nothing worth recording, write nothing "
+    "and simply end."
 )
 print(json.dumps({"decision": "block", "reason": reason}))
 sys.exit(0)
