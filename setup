@@ -1,0 +1,119 @@
+#!/bin/sh
+# setup — wire biscuit-harness into ~/.claude
+#
+# Idempotent: safe to re-run any time. Never copies files — agents and skills
+# are symlinked, hooks are registered by path, so `git pull` updates everything.
+#
+# Usage:
+#   ./setup           personal install
+#   ./setup --team    personal install + print team-mode next steps
+#
+# Env:
+#   CLAUDE_DIR   override ~/.claude (used by tests)
+set -e
+
+HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+MODE="personal"
+[ "$1" = "--team" ] && MODE="team"
+
+command -v python3 >/dev/null 2>&1 || {
+  echo "setup: python3 is required (macOS: xcode-select --install)" >&2
+  exit 1
+}
+
+mkdir -p "$CLAUDE_DIR/agents" "$CLAUDE_DIR/skills"
+chmod +x "$HARNESS_DIR"/hooks/*.sh "$HARNESS_DIR"/bin/* 2>/dev/null || true
+
+# 1. agents/*.md → ~/.claude/agents/ (symlink)
+AGENTS=0
+for f in "$HARNESS_DIR"/agents/*.md; do
+  [ -e "$f" ] || continue
+  base="$(basename "$f")"
+  [ "$base" = "README.md" ] && continue
+  ln -sf "$f" "$CLAUDE_DIR/agents/$base"
+  AGENTS=$((AGENTS + 1))
+done
+
+# 2. skills/<name>/ → ~/.claude/skills/<name> (symlink, only dirs with SKILL.md)
+SKILLS=0
+for d in "$HARNESS_DIR"/skills/*/; do
+  [ -f "${d}SKILL.md" ] || continue
+  name="$(basename "$d")"
+  target="$CLAUDE_DIR/skills/$name"
+  if [ -e "$target" ] && [ ! -L "$target" ]; then
+    echo "  ! skill '$name': $target already exists and is not a symlink — skipped" >&2
+    continue
+  fi
+  ln -sfn "${d%/}" "$target"
+  SKILLS=$((SKILLS + 1))
+done
+
+# 3. hooks + guardrail deny rules → ~/.claude/settings.json
+python3 - "$HARNESS_DIR" "$CLAUDE_DIR/settings.json" <<'PY'
+import json, sys
+
+harness, path = sys.argv[1], sys.argv[2]
+
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    settings = {}
+except json.JSONDecodeError:
+    sys.exit(f"setup: {path} is not valid JSON — fix it and re-run")
+
+hooks = settings.setdefault("hooks", {})
+
+def ensure_hook(event, matcher, command):
+    entries = hooks.setdefault(event, [])
+    for e in entries:
+        for h in e.get("hooks", []):
+            if h.get("command") == command:
+                return False
+    entry = {"hooks": [{"type": "command", "command": command}]}
+    if matcher:
+        entry["matcher"] = matcher
+    entries.append(entry)
+    return True
+
+added = []
+if ensure_hook("SessionStart", None, f"{harness}/hooks/auto-update.sh"):
+    added.append("SessionStart: auto-update")
+if ensure_hook("PostToolUse", "Edit|Write|MultiEdit", f"{harness}/hooks/check-types.sh"):
+    added.append("PostToolUse: check-types")
+if ensure_hook("PostToolUse", "Edit|Write|MultiEdit", f"{harness}/hooks/check-type-dup.sh"):
+    added.append("PostToolUse: check-type-dup")
+
+deny = settings.setdefault("permissions", {}).setdefault("deny", [])
+for rule in [
+    "Bash(git push --force:*)",
+    "Bash(git push -f:*)",
+    "Bash(rm -rf /:*)",
+    "Bash(rm -rf ~:*)",
+    "Bash(rm -rf $HOME:*)",
+]:
+    if rule not in deny:
+        deny.append(rule)
+        added.append(f"deny: {rule}")
+
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+
+for a in added:
+    print(f"  + {a}")
+if not added:
+    print("  = settings.json already up to date")
+PY
+
+echo ""
+echo "✅ biscuit-harness installed ($AGENTS agents, $SKILLS skills linked)"
+echo "   Updates arrive automatically: every session start pulls the latest (1h throttle)."
+
+if [ "$MODE" = "team" ]; then
+  echo ""
+  echo "Team mode — next, inside each project repo, run:"
+  echo "   $HARNESS_DIR/bin/team-init required   # or 'optional'"
+  echo "   git add .claude/ && git commit -m 'require biscuit-harness for AI-assisted work'"
+fi

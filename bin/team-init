@@ -1,0 +1,73 @@
+#!/bin/sh
+# team-init [required|optional] — plant the harness marker in the current project repo.
+#
+# Writes a SessionStart hook into <project>/.claude/settings.json (committed to git)
+# that checks whether biscuit-harness is installed on the machine:
+#   required → Claude is told to stop and have the user install before doing work
+#   optional → a one-line install suggestion
+#
+# No harness code is vendored into the project — only this marker.
+set -e
+
+MODE="${1:-optional}"
+case "$MODE" in
+  required|optional) ;;
+  *) echo "usage: team-init [required|optional]" >&2; exit 1 ;;
+esac
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "team-init: run this inside the project's git repo" >&2
+  exit 1
+}
+
+mkdir -p "$ROOT/.claude"
+
+python3 - "$ROOT/.claude/settings.json" "$MODE" <<'PY'
+import json, sys
+
+path, mode = sys.argv[1], sys.argv[2]
+
+INSTALL = (
+    "git clone --single-branch --depth 1 "
+    "https://github.com/yonghyun-jin/Biscuit-harness.git ~/.claude/skills/biscuit-harness "
+    "&& ~/.claude/skills/biscuit-harness/setup"
+)
+
+if mode == "required":
+    msg = (
+        "REQUIRED: this project requires biscuit-harness for AI-assisted work and it is "
+        "not installed on this machine. Stop: tell the user to run  " + INSTALL +
+        "  and do not start implementation work until it is installed."
+    )
+else:
+    msg = "This project recommends biscuit-harness. Install once with:  " + INSTALL
+
+# Message contains no single quotes, so it can sit inside sh -c '...' as-is.
+cmd = 'sh -c \'[ -d "$HOME/.claude/skills/biscuit-harness" ] || echo "%s"\'' % msg
+
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    settings = {}
+except json.JSONDecodeError:
+    sys.exit(f"team-init: {path} is not valid JSON — fix it and re-run")
+
+entries = settings.setdefault("hooks", {}).setdefault("SessionStart", [])
+# Replace any previous harness marker so re-running switches modes cleanly
+entries[:] = [
+    e for e in entries
+    if not any("biscuit-harness" in h.get("command", "") for h in e.get("hooks", []))
+]
+entries.append({"hooks": [{"type": "command", "command": cmd}]})
+
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+
+print(f"  + SessionStart marker ({mode}) → {path}")
+PY
+
+echo ""
+echo "✅ team marker planted ($MODE). Commit it:"
+echo "   git add .claude/ && git commit -m 'require biscuit-harness for AI-assisted work'"
