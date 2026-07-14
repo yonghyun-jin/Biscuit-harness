@@ -6,12 +6,17 @@
 # personal data: they go to ~/.claude/learnings/<project>.md on THIS machine
 # only — never into any repo, never shared with the team.
 
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # The heredoc below occupies stdin, so hand the hook payload to python via env.
 BH_HOOK_INPUT=$(cat)
 export BH_HOOK_INPUT
 
-python3 - <<'PY'
-import json, os, subprocess, sys
+python3 - "$HOOK_DIR" <<'PY'
+import json, os, sys
+
+sys.path.insert(0, sys.argv[1])
+from _project_name import project_name
 
 try:
     data = json.loads(os.environ.get("BH_HOOK_INPUT") or "{}")
@@ -31,30 +36,8 @@ try:
 except OSError:
     pass  # can't read it — fail open and still ask
 
-# Project name, most stable first: origin remote repo name (same across
-# machines and folder renames) → git toplevel folder name → cwd basename.
 cwd = data.get("cwd") or os.getcwd()
-
-def git(*args):
-    try:
-        r = subprocess.run(
-            ["git", "-C", cwd, *args],
-            capture_output=True, text=True, timeout=5,
-        )
-        return r.stdout.strip() if r.returncode == 0 else ""
-    except Exception:
-        return ""
-
-name = ""
-origin = git("remote", "get-url", "origin")
-if origin:
-    name = os.path.basename(origin.rstrip("/"))
-    if name.endswith(".git"):
-        name = name[:-4]
-if not name:
-    top = git("rev-parse", "--show-toplevel")
-    name = os.path.basename(top) if top else ""
-name = name or os.path.basename(cwd.rstrip("/")) or "misc"
+name = project_name(cwd)
 
 target = os.path.join(os.path.expanduser("~/.claude/learnings"), f"{name}.md")
 try:
@@ -70,8 +53,10 @@ reason = (
     "- <one concise bullet per learning>\n\n"
     "Rules: only non-obvious items (skip anything derivable from the code, docs, or "
     "git history); write for your future self months from now; read the file first "
-    "and do not duplicate entries that are already there. This file is the user's "
-    "personal machine-local memory — never commit it or copy it into a repo. "
+    "and do not duplicate entries that are already there. If the file has grown past "
+    "~150 lines, consolidate it while you're there: merge overlapping entries and "
+    "drop ones that are now obsolete. This file is the user's personal machine-local "
+    "memory — never commit it or copy it into a repo. "
     "If this session genuinely produced nothing worth recording, write nothing and "
     "simply end."
 )

@@ -78,6 +78,8 @@ hooks/
   learn-on-stop.sh       Stop: before the session ends, has the model record
                          non-obvious learnings to ~/.claude/learnings/<project>.md
                          — personal, machine-local data; never committed or shared
+  learn-recall.sh        SessionStart: injects this project's accumulated personal
+                         learnings back into context (the read path of the loop)
 bin/
   team-init              plants the required|optional marker in a project repo
 ```

@@ -86,6 +86,8 @@ if ensure_hook("PostToolUse", "Edit|Write|MultiEdit", f"{harness}/hooks/check-ty
     added.append("PostToolUse: check-type-dup")
 if ensure_hook("Stop", None, f"{harness}/hooks/learn-on-stop.sh"):
     added.append("Stop: learn-on-stop")
+if ensure_hook("SessionStart", None, f"{harness}/hooks/learn-recall.sh"):
+    added.append("SessionStart: learn-recall")
 
 deny = settings.setdefault("permissions", {}).setdefault("deny", [])
 for rule in [
