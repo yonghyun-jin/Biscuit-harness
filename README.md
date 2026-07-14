@@ -82,9 +82,30 @@ hooks/
   learn-recall.sh        SessionStart: injects Rules in full (standing knowledge,
                          no matching needed) + an index of Episode headings with an
                          instruction to Read the matching entry before related work
+  metrics-on-end.sh      SessionEnd: parses the session transcript into one metrics
+                         line (duration, messages, tool calls/errors, tokens, harness
+                         skill uses) tagged with the harness version
 bin/
   team-init              plants the required|optional marker in a project repo
+  harness-stats          impact report over the local metrics (see Metrics below)
 ```
+
+## Metrics (personal, local — never transmitted)
+
+Hooks log what they catch to `~/.claude/metrics/` on your machine only:
+`hook-events.jsonl` (one line per meaningful hook firing — e.g. type errors
+caught pre-build) and `sessions.jsonl` (one line per session, tagged with the
+harness version). Files rotate at 5MB. Nothing is sent anywhere; each person
+owns their own data, same as learnings.
+
+```sh
+~/.claude/skills/biscuit-harness/bin/harness-stats            # full report
+~/.claude/skills/biscuit-harness/bin/harness-stats --since 30 # last 30 days
+```
+
+The report shows attribution ("what did the harness catch") and the trend by
+version — `friction` (tool errors / tool calls) drifting down across versions
+means the harness is working.
 
 `setup` also adds guardrail deny rules to `~/.claude/settings.json`
 (`git push --force`, `rm -rf /`, `rm -rf ~`). Remove them from the `deny`

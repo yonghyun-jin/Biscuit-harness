@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+# harness-stats — impact report over ~/.claude/metrics/ (personal, local data).
+#
+#   harness-stats                     full report
+#   harness-stats --project my-app    filter to one project
+#   harness-stats --by project        group session table by project
+#   harness-stats --since 30          only the last N days
+#
+# Top block answers "what did the harness catch?" (attribution, from
+# hook-events.jsonl). Bottom block answers "is it getting better across
+# versions?" (trend, from sessions.jsonl). friction = tool_errors/tool_calls.
+import argparse
+import json
+import os
+from datetime import datetime, timedelta, timezone
+
+METRICS_DIR = os.path.expanduser("~/.claude/metrics")
+
+
+def read_jsonl(name):
+    rows = []
+    for fn in (name.replace(".jsonl", ".1.jsonl"), name):  # rotated first (older)
+        path = os.path.join(METRICS_DIR, fn)
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+        except OSError:
+            continue
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project")
+    ap.add_argument("--by", choices=["version", "project"], default="version")
+    ap.add_argument("--since", type=int, metavar="DAYS")
+    args = ap.parse_args()
+
+    cutoff = None
+    if args.since:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=args.since)) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def keep(row):
+        if args.project and row.get("project") != args.project:
+            return False
+        if cutoff and (row.get("ts") or "") < cutoff:
+            return False
+        return True
+
+    events = [e for e in read_jsonl("hook-events.jsonl") if keep(e)]
+    sessions = [s for s in read_jsonl("sessions.jsonl") if keep(s)]
+
+    print("== Harness impact (hook-events) ==")
+    if not events:
+        print("  no events recorded yet")
+    else:
+        ct = [e for e in events if e.get("hook") == "check-types"]
+        ct_err = [e for e in ct if (e.get("data") or {}).get("result") == "errors"]
+        clean_errs = sum((e["data"].get("error_count") or 0)
+                         for e in ct_err if not e["data"].get("is_burst"))
+        bursts = sum(1 for e in ct_err if e["data"].get("is_burst"))
+        dup = [e for e in events if e.get("hook") == "check-type-dup"]
+        dup_flagged = sum(len((e.get("data") or {}).get("flagged") or []) for e in dup)
+        prompts = sum(1 for e in events if e.get("hook") == "learn-on-stop")
+        recalls = [e for e in events if e.get("hook") == "learn-recall"]
+
+        print(f"  type errors caught pre-build (check-types):  {clean_errs}"
+              f"  (burst events excluded: {bursts})")
+        print(f"  check-types runs (clean/errors):             "
+              f"{len(ct) - len(ct_err)}/{len(ct_err)}")
+        print(f"  inline domain types flagged (check-type-dup): {dup_flagged}")
+        print(f"  learning prompts at session end:              {prompts}")
+        if recalls:
+            r = sum((e.get("data") or {}).get("rules_count") or 0 for e in recalls)
+            ep = sum((e.get("data") or {}).get("episodes_count") or 0 for e in recalls)
+            print(f"  learnings injected (avg rules/episodes):     "
+                  f"{r / len(recalls):.1f} / {ep / len(recalls):.1f}")
+        by_session = {}
+        for e in events:
+            sid = e.get("session_id") or "?"
+            by_session[sid] = by_session.get(sid, 0) + 1
+        if by_session:
+            print(f"  avg hook chain per session:                   "
+                  f"{sum(by_session.values()) / len(by_session):.1f}")
+
+    print()
+    key = "harness_version" if args.by == "version" else "project"
+    print(f"== Sessions by {args.by} (sessions.jsonl) ==")
+    if not sessions:
+        print("  no sessions recorded yet")
+        return
+
+    groups = {}
+    for s in sessions:
+        groups.setdefault(s.get(key) or "?", []).append(s)
+
+    hdr = f"{args.by:<12} {'sessions':>8} {'avg_dur':>8} {'user_msgs':>10} " \
+          f"{'friction':>9} {'skill_uses':>11}"
+    print("  " + hdr)
+    for g, rows in sorted(groups.items(), key=lambda kv: kv[0], reverse=True):
+        n = len(rows)
+        dur = sum(r.get("duration_s") or 0 for r in rows) / n
+        msgs = sum(r.get("user_msgs") or 0 for r in rows) / n
+        calls = sum(r.get("tool_calls") or 0 for r in rows)
+        errs = sum(r.get("tool_errors") or 0 for r in rows)
+        friction = f"{errs / calls * 100:.1f}%" if calls else "n/a"
+        skills = sum(r.get("harness_skill_uses") or 0 for r in rows)
+        print(f"  {g:<12} {n:>8} {int(dur // 60):>7}m {msgs:>10.1f} "
+              f"{friction:>9} {skills:>11}")
+
+
+if __name__ == "__main__":
+    main()

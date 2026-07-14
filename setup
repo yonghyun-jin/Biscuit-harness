@@ -88,6 +88,8 @@ if ensure_hook("Stop", None, f"{harness}/hooks/learn-on-stop.sh"):
     added.append("Stop: learn-on-stop")
 if ensure_hook("SessionStart", None, f"{harness}/hooks/learn-recall.sh"):
     added.append("SessionStart: learn-recall")
+if ensure_hook("SessionEnd", None, f"{harness}/hooks/metrics-on-end.sh"):
+    added.append("SessionEnd: metrics-on-end")
 
 deny = settings.setdefault("permissions", {}).setdefault("deny", [])
 for rule in [

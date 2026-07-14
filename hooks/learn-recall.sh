@@ -38,9 +38,35 @@ except OSError:
 if not text:
     sys.exit(0)
 
+
+def count_tiers(t):
+    rules_n = 0
+    in_rules = False
+    for ln in t.splitlines():
+        if ln.strip() == "# Rules":
+            in_rules = True
+            continue
+        if in_rules and ln.startswith("# ") and not ln.startswith("## "):
+            in_rules = False
+        if in_rules and ln.lstrip().startswith("- "):
+            rules_n += 1
+    return rules_n, sum(1 for ln in t.splitlines() if ln.startswith("## "))
+
+
+def log_injection(t):
+    try:
+        from _metric import log_event
+        r, e = count_tiers(t)
+        log_event("learn-recall", data.get("session_id", ""), name,
+                  {"rules_count": r, "episodes_count": e})
+    except Exception:
+        pass
+
+
 # Small file: inject it whole — an index would cost more than it saves.
 FULL_TEXT_MAX = 1500
 if len(text) <= FULL_TEXT_MAX:
+    log_injection(text)
     print(
         f'<personal-learnings project="{name}" source="{path}">\n'
         "Your accumulated learnings from past sessions in this project "
@@ -69,6 +95,7 @@ index = "\n".join(f"- {h[3:].strip()}" for h in headings)
 
 if not rules_text and not headings:
     sys.exit(0)
+log_injection(text)
 
 parts = []
 if rules_text:

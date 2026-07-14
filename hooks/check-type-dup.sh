@@ -2,13 +2,16 @@
 # PostToolUse hook (Edit|Write|MultiEdit) — flag new domain interface/type
 # declarations written inline under apps/ in a monorepo that has a packages/
 # dir. Nudges Claude to reuse or relocate the type to packages/shared.
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # The heredoc below occupies stdin, so hand the hook payload to python via env.
 BH_HOOK_INPUT=$(cat)
 export BH_HOOK_INPUT
 
-python3 - <<'PY'
+python3 - "$HOOK_DIR" <<'PY'
 import json, os, re, sys
+
+sys.path.insert(0, sys.argv[1])
 
 try:
     data = json.loads(os.environ.get("BH_HOOK_INPUT") or "{}")
@@ -41,6 +44,14 @@ while d and d != "/":
     d = os.path.dirname(d)
 if not packages:
     sys.exit(0)
+
+try:
+    from _metric import log_event
+    from _project_name import project_name
+    log_event("check-type-dup", data.get("session_id", ""),
+              project_name(data.get("cwd") or os.getcwd()), {"flagged": decls})
+except Exception:
+    pass
 
 print(
     f"New type declaration(s) inline in apps/: {', '.join(decls)}. "

@@ -81,6 +81,12 @@ reason = (
     "If this session genuinely produced nothing worth recording, write nothing "
     "and simply end."
 )
+try:
+    from _metric import log_event
+    log_event("learn-on-stop", data.get("session_id", ""), name, {"action": "prompted"})
+except Exception:
+    pass
+
 print(json.dumps({"decision": "block", "reason": reason}))
 sys.exit(0)
 PY
