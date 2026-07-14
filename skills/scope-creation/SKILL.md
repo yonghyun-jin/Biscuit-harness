@@ -181,8 +181,8 @@ How do we know this project is DONE?
 - **Out-of-Scope is mandatory.** Never skip it. If the user didn't mention exclusions, infer likely scope creep candidates from context and list them.
 - **Ambiguous Zone is mandatory.** There are ALWAYS gray areas. If you can't find any, you haven't thought hard enough.
 - **No fluff.** Every line should be actionable or decision-forcing. Remove filler words.
-- **Korean + English is OK.** Match the user's language. If they mix, you mix.
+- **Match the user's language.** Whatever language(s) they write in, respond in kind. If they mix, you mix.
 - **Teams-friendly formatting.** No nested tables, no HTML, no complex markdown. Keep it clean — headers, bullets, simple tables only.
 - **Be opinionated.** If something is obviously out-of-scope based on constraints, say so. Don't hedge everything.
-- **Resources section must be concrete.** "We need a developer" is bad. "Sean: 20hrs/week on API integration" is good.
+- **Resources section must be concrete.** "We need a developer" is bad. "Jane: 20hrs/week on API integration" is good.
 - **One file, one scope.** Don't split across multiple files.

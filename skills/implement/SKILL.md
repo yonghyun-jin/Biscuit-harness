@@ -69,7 +69,7 @@ Then continue with Step 3 (use the slug where a ticket ID would be used).
 ### Step 3: Create a branch from latest main
 
 Branch name: `<user>/<ticket-id-lowercase>` — derive `<user>` from
-`git config user.name` (first name, lowercased). Example: `sean/abc-123`.
+`git config user.name` (first name, lowercased). Example: `jane/abc-123`.
 Do NOT use Linear's suggested `gitBranchName` — too long.
 
 ```bash

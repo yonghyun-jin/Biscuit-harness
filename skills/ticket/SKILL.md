@@ -41,7 +41,7 @@ actionable implementation tickets.
 
 ### Step 1: Understand the request
 
-If the user gave a Linear ticket ID (e.g., `AI-42`), fetch it with `mcp__linear-server__get_issue`.
+If the user gave a Linear ticket ID (e.g., `ABC-42` — any team prefix), fetch it with `mcp__linear-server__get_issue`.
 If the user gave raw text, parse it for intent.
 
 ### Step 2: Research the codebase
@@ -107,7 +107,7 @@ the ticket description with the structured content.
 ## Rules
 
 - **Always research the codebase first.** Never guess at file paths or architecture.
-- **Be specific.** "Update the component" is bad. "Update `apps/web/components/voice-agent/VoiceToggle.tsx` to add a mute button" is good.
+- **Be specific.** "Update the component" is bad. "Update `src/components/SearchBar.tsx` to add a clear button" is good — always use real paths from the project you researched.
 - **Minimal changes.** Default to the smallest change that achieves the goal. Call out scope creep.
 - **No invented requirements.** Only include what the user asked for. Don't add "nice to have" items.
 - **File paths must be real.** Every file listed in Blast Radius must exist (or be a clearly-marked new file).
