@@ -1,7 +1,10 @@
 #!/bin/sh
 # SessionStart hook — the READ path of the learning loop.
-# Injects this project's personal learnings (~/.claude/learnings/<repo>.md,
-# written by learn-on-stop.sh) into the new session's context.
+# Injects an INDEX (the "## " heading lines) of this project's personal
+# learnings (~/.claude/learnings/<repo>.md, written by learn-on-stop.sh) into
+# the new session's context, plus a standing instruction to Read the relevant
+# section before starting related work. Small files are injected whole —
+# an index would cost more than it saves.
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # The heredoc below occupies stdin, so hand the hook payload to python via env.
@@ -32,19 +35,32 @@ except OSError:
 if not text:
     sys.exit(0)
 
-# Keep context lean: entries are appended chronologically, so the tail is
-# the most recent — inject at most the last ~6KB.
-MAX = 6000
-if len(text) > MAX:
-    cut = text[-MAX:]
-    nl = cut.find("\n## ")  # start at the first complete entry in the window
-    text = "…(older entries truncated — full file: " + path + ")…\n" + (cut[nl + 1:] if nl != -1 else cut)
+# Small file: inject it whole — an index would cost more than it saves.
+FULL_TEXT_MAX = 1500
+if len(text) <= FULL_TEXT_MAX:
+    print(
+        f'<personal-learnings project="{name}" source="{path}">\n'
+        "Your accumulated learnings from past sessions in this project "
+        "(personal, machine-local — never commit or share this content):\n\n"
+        f"{text}\n"
+        "</personal-learnings>"
+    )
+    sys.exit(0)
+
+# Large file: inject only the index (heading lines). The model reads the
+# full entry on demand, at the moment a related request actually arrives.
+headings = [ln for ln in text.splitlines() if ln.startswith("## ")]
+if not headings:
+    sys.exit(0)
+index = "\n".join(f"- {h[3:].strip()}" for h in headings)
 
 print(
-    f'<personal-learnings project="{name}" source="{path}">\n'
-    "Your accumulated learnings from past sessions in this project "
-    "(personal, machine-local — never commit or share this content):\n\n"
-    f"{text}\n"
-    "</personal-learnings>"
+    f'<personal-learnings-index project="{name}" source="{path}">\n'
+    "Index of your learnings from past sessions in this project. "
+    f"BEFORE starting any work related to one of these topics, Read {path} "
+    "and apply the matching entry. This content is personal machine-local "
+    "memory — never commit or share it.\n\n"
+    f"{index}\n"
+    "</personal-learnings-index>"
 )
 PY

@@ -49,8 +49,13 @@ reason = (
     "Before ending this session: if it produced NON-OBVIOUS learnings — gotchas, "
     "debugging insights, project quirks, corrections the user gave you, decisions "
     f"and their reasons — append them to {target} in this format:\n\n"
-    "## <YYYY-MM-DD> — <one-line session topic>\n"
+    "## <YYYY-MM-DD> — <specific, searchable topic>\n"
     "- <one concise bullet per learning>\n\n"
+    "The heading is load-bearing: future sessions see ONLY the heading lines as an "
+    "index and decide from them whether to read the entry, so a vague heading makes "
+    "the entry unfindable. Name the concrete system/file/feature and the symptom. "
+    'Bad: "## 2026-07-14 — bug fix". '
+    'Good: "## 2026-07-14 — Railway healthcheck path misconfig causes restart loop".\n\n'
     "Rules: only non-obvious items (skip anything derivable from the code, docs, or "
     "git history); write for your future self months from now; read the file first "
     "and do not duplicate entries that are already there. If the file has grown past "
