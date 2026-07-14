@@ -31,18 +31,29 @@ try:
 except OSError:
     pass  # can't read it — fail open and still ask
 
-# Project name: git repo name if inside one, else the cwd basename.
+# Project name, most stable first: origin remote repo name (same across
+# machines and folder renames) → git toplevel folder name → cwd basename.
 cwd = data.get("cwd") or os.getcwd()
+
+def git(*args):
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, *args],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
 name = ""
-try:
-    r = subprocess.run(
-        ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, timeout=5,
-    )
-    if r.returncode == 0:
-        name = os.path.basename(r.stdout.strip())
-except Exception:
-    pass
+origin = git("remote", "get-url", "origin")
+if origin:
+    name = os.path.basename(origin.rstrip("/"))
+    if name.endswith(".git"):
+        name = name[:-4]
+if not name:
+    top = git("rev-parse", "--show-toplevel")
+    name = os.path.basename(top) if top else ""
 name = name or os.path.basename(cwd.rstrip("/")) or "misc"
 
 target = os.path.join(os.path.expanduser("~/.claude/learnings"), f"{name}.md")
