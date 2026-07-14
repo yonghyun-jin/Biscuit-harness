@@ -46,12 +46,22 @@ If context is insufficient, ask the user targeted questions:
 
 Do NOT ask more than 3 questions. Work with what you have.
 
-### Step 2: Research (if codebase exists)
+### Step 2: Impact analysis (mandatory when a codebase exists)
 
-If the scope involves code changes:
-- Use `Grep` and `Glob` to find relevant files
-- Understand current architecture
-- Identify integration points and dependencies
+This is the core of the scope document — spend more effort here than on
+timelines. If the scope involves code changes:
+
+- Use `Grep` and `Glob` to find every file the work would touch
+- For each touched file, trace **what depends on it**: which
+  features/pages/flows import it or break if it changes
+- Identify shared code (types, utils, API clients) where a change ripples
+  into other features
+- Identify integration points: APIs, DB schema, external services, auth
+- Classify each impacted feature: directly modified / indirectly affected /
+  must-not-break
+
+Never guess — every file path and feature named in the document must come
+from actual codebase research.
 
 ### Step 3: Write the scope document
 
@@ -79,8 +89,8 @@ Include measurable impact if possible — "currently takes X hours", "error rate
 ## Business Objective
 
 [One clear, measurable goal this project achieves.
-Format: "[Action verb] + [metric] + by [when]"
-Example: "Reduce contract processing time from 45 min to under 5 min per client by Q3 2026"]
+Format: "[Action verb] + [metric]" — a deadline is optional, not the point.
+Example: "Reduce contract processing time from 45 min to under 5 min per client"]
 
 ---
 
@@ -107,8 +117,35 @@ Example: "Reduce contract processing time from 45 min to under 5 min per client 
 - **[Item 2]** — [Why excluded]
 - **[Item 3]** — [Why excluded]
 
-[This is THE most important section. Be specific and exhaustive.
+[Be specific and exhaustive.
 Every gray area should be listed here or in Ambiguous Zone.]
+
+---
+
+## Impact Analysis (Files & Features)
+
+> THE most important section. What does this work actually touch,
+> and what could it break? Every path below comes from codebase research.
+
+### Files & Modules Touched
+
+| File / Module | Change Type | Why |
+|---------------|-------------|-----|
+| `path/to/file` | modified / created / deleted | [reason] |
+
+### Features & Flows Impacted
+
+- **Directly modified:** [feature/flow] — [what changes for it]
+- **Indirectly affected:** [feature/flow] — [imports/depends on a touched file: which one]
+- **Must not break:** [feature/flow] — [why it's at risk, how we protect it]
+
+### Shared Code & Ripple Effects
+
+- [shared type / util / API client being changed] → [every consumer affected]
+
+### Integration Points
+
+- [API / DB schema / external service / auth surface touched, or "None"]
 
 ---
 
@@ -116,10 +153,10 @@ Every gray area should be listed here or in Ambiguous Zone.]
 
 > These items are unclear — we need stakeholder input before proceeding.
 
-| # | Item | Options | Decision Needed By | Owner |
-|---|------|---------|-------------------|-------|
-| 1 | [Description] | A: [option] / B: [option] | [Date] | [Person] |
-| 2 | [Description] | A: [option] / B: [option] | [Date] | [Person] |
+| # | Item | Options | Blocks | Owner |
+|---|------|---------|--------|-------|
+| 1 | [Description] | A: [option] / B: [option] | [which impacted file/feature is blocked] | [Person] |
+| 2 | [Description] | A: [option] / B: [option] | [which impacted file/feature is blocked] | [Person] |
 
 ---
 
@@ -162,9 +199,10 @@ How do we know this project is DONE?
 
 ## Next Steps
 
-1. [ ] [Immediate action] — **Owner:** [Name] — **By:** [Date]
-2. [ ] [Next action] — **Owner:** [Name] — **By:** [Date]
-3. [ ] [Next action] — **Owner:** [Name] — **By:** [Date]
+1. [ ] [Immediate action] — **Owner:** [Name]
+2. [ ] [Next action] — **Owner:** [Name]
+3. [ ] [Next action] — **Owner:** [Name]
+[Dates optional — add one only when there's a real external deadline]
 ```
 
 ### Step 4: Save and confirm
@@ -172,12 +210,19 @@ How do we know this project is DONE?
 1. Save the file as `scope-[project-name].md` in the working directory
 2. Show a brief summary to the user:
    - Number of in-scope deliverables
+   - Files/modules touched and features impacted (the impact headline)
    - Number of out-of-scope items
    - Number of ambiguous items needing decisions
    - Key risks
 
 ## Rules
 
+- **Impact over timelines.** The document's center of gravity is WHICH files
+  and WHICH features are affected — not how long things take or by when.
+  Only include dates driven by real external deadlines.
+- **Impact Analysis is mandatory and research-backed.** Every file path in it
+  must exist in the codebase; every impacted feature must trace to a touched
+  file. No guessed paths.
 - **Out-of-Scope is mandatory.** Never skip it. If the user didn't mention exclusions, infer likely scope creep candidates from context and list them.
 - **Ambiguous Zone is mandatory.** There are ALWAYS gray areas. If you can't find any, you haven't thought hard enough.
 - **No fluff.** Every line should be actionable or decision-forcing. Remove filler words.
