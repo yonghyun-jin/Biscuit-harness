@@ -65,12 +65,33 @@ except json.JSONDecodeError:
 
 hooks = settings.setdefault("hooks", {})
 
+HOOK_BASENAMES = {
+    "auto-update.sh", "check-types.sh", "check-type-dup.sh",
+    "learn-on-stop.sh", "learn-recall.sh", "metrics-on-end.sh",
+}
+
+# Detected BEFORE registering anything: any harness hook already present means
+# this machine installed before. One-time additions (the guardrail deny rules)
+# are skipped then, so a user's deliberate removal of a rule survives updates —
+# the harness only ever touches entries it created, and only adds them once.
+already_installed = any(
+    h.get("command", "").rsplit("/", 1)[-1] in HOOK_BASENAMES
+    for ev in hooks.values() for e in ev for h in e.get("hooks", [])
+)
+
 def ensure_hook(event, matcher, command):
+    # Dedupe by script basename, not full path: a moved/re-cloned harness
+    # repoints the existing entry instead of registering a duplicate.
+    base = command.rsplit("/", 1)[-1]
     entries = hooks.setdefault(event, [])
     for e in entries:
         for h in e.get("hooks", []):
-            if h.get("command") == command:
-                return False
+            cmd = h.get("command", "")
+            if cmd.rsplit("/", 1)[-1] == base:
+                if cmd == command:
+                    return False
+                h["command"] = command
+                return True
     entry = {"hooks": [{"type": "command", "command": command}]}
     if matcher:
         entry["matcher"] = matcher
@@ -91,17 +112,18 @@ if ensure_hook("SessionStart", None, f"{harness}/hooks/learn-recall.sh"):
 if ensure_hook("SessionEnd", None, f"{harness}/hooks/metrics-on-end.sh"):
     added.append("SessionEnd: metrics-on-end")
 
-deny = settings.setdefault("permissions", {}).setdefault("deny", [])
-for rule in [
-    "Bash(git push --force:*)",
-    "Bash(git push -f:*)",
-    "Bash(rm -rf /:*)",
-    "Bash(rm -rf ~:*)",
-    "Bash(rm -rf $HOME:*)",
-]:
-    if rule not in deny:
-        deny.append(rule)
-        added.append(f"deny: {rule}")
+if not already_installed:
+    deny = settings.setdefault("permissions", {}).setdefault("deny", [])
+    for rule in [
+        "Bash(git push --force:*)",
+        "Bash(git push -f:*)",
+        "Bash(rm -rf /:*)",
+        "Bash(rm -rf ~:*)",
+        "Bash(rm -rf $HOME:*)",
+    ]:
+        if rule not in deny:
+            deny.append(rule)
+            added.append(f"deny: {rule}")
 
 with open(path, "w") as f:
     json.dump(settings, f, indent=2)
