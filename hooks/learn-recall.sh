@@ -1,7 +1,11 @@
 #!/bin/sh
-# SessionStart hook — the READ path of the learning loop.
-# The learnings file (~/.claude/learnings/<repo>.md, written by
-# learn-on-stop.sh) has two tiers, injected differently:
+# SessionStart hook — the READ path of the rules loop.
+# The rules file (written by learn-on-stop.sh) lives IN the project repo
+# at <repo>/.claude/rules.md (committed — clone = inherit). Outside a git
+# repo, falls back to the legacy machine-local ~/.claude/rules/<project>.md.
+# (Script filename stays learn-recall.sh: it is registered by absolute path
+# in settings.json — renaming it silently breaks existing installs.)
+# Two tiers, injected differently:
 #   # Rules    → injected IN FULL every session (standing knowledge that
 #                applies to all work — no relevance matching needed)
 #   # Episodes → only "## " heading lines as an index, plus a standing
@@ -18,7 +22,7 @@ python3 - "$HOOK_DIR" <<'PY'
 import json, os, sys
 
 sys.path.insert(0, sys.argv[1])
-from _project_name import project_name
+from _project_name import project_name, git_toplevel
 
 try:
     data = json.loads(os.environ.get("BH_HOOK_INPUT") or "{}")
@@ -27,8 +31,24 @@ except Exception:
 
 cwd = data.get("cwd") or os.getcwd()
 name = project_name(cwd)
-path = os.path.join(os.path.expanduser("~/.claude/learnings"), f"{name}.md")
-if not os.path.isfile(path):
+
+toplevel = git_toplevel(cwd)
+repo_path = os.path.join(toplevel, ".claude", "rules.md") if toplevel else ""
+legacy_path = os.path.join(os.path.expanduser("~/.claude/rules"), f"{name}.md")
+
+migrate_note = ""
+if repo_path and os.path.isfile(repo_path):
+    path, scope = repo_path, "repo"
+elif os.path.isfile(legacy_path):
+    path, scope = legacy_path, "legacy"
+    if toplevel:
+        migrate_note = (
+            f"\nNOTE: these rules still live at the legacy machine-local "
+            f"path. Migrate them: move the content to {repo_path} (create the "
+            f"file), delete {legacy_path}, and let the user commit it — from "
+            f"then on the whole team inherits them via git."
+        )
+else:
     sys.exit(0)
 
 try:
@@ -37,6 +57,19 @@ except OSError:
     sys.exit(0)
 if not text:
     sys.exit(0)
+
+if scope == "repo":
+    sharing_line = (
+        "Project rules and episode records accumulated across sessions, "
+        "shared with everyone on this project via the repo:"
+    )
+    footer = ""
+else:
+    sharing_line = (
+        "Your accumulated rules from past sessions in this project "
+        "(personal, machine-local):"
+    )
+    footer = migrate_note
 
 
 def count_tiers(t):
@@ -58,7 +91,7 @@ def log_injection(t):
         from _metric import log_event
         r, e = count_tiers(t)
         log_event("learn-recall", data.get("session_id", ""), name,
-                  {"rules_count": r, "episodes_count": e})
+                  {"rules_count": r, "episodes_count": e, "source": scope})
     except Exception:
         pass
 
@@ -68,11 +101,11 @@ FULL_TEXT_MAX = 1500
 if len(text) <= FULL_TEXT_MAX:
     log_injection(text)
     print(
-        f'<personal-learnings project="{name}" source="{path}">\n'
-        "Your accumulated learnings from past sessions in this project "
-        "(personal, machine-local — never commit or share this content):\n\n"
+        f'<project-rules project="{name}" source="{path}">\n'
+        f"{sharing_line}\n\n"
         f"{text}\n"
-        "</personal-learnings>"
+        f"{footer}"
+        "</project-rules>"
     )
     sys.exit(0)
 
@@ -97,7 +130,7 @@ if not rules_text and not headings:
     sys.exit(0)
 log_injection(text)
 
-parts = []
+parts = [sharing_line]
 if rules_text:
     parts.append(
         "STANDING RULES for this project — these apply to ALL work this "
@@ -105,16 +138,16 @@ if rules_text:
     )
 if headings:
     parts.append(
-        "Index of past episode learnings. BEFORE starting any work related "
+        "Index of past episode records. BEFORE starting any work related "
         f"to one of these topics, Read {path} and apply the matching "
         "entry:\n\n" + index
     )
 
 body = "\n\n".join(parts)
 print(
-    f'<personal-learnings project="{name}" source="{path}">\n'
-    f"{body}\n\n"
-    "This content is personal machine-local memory — never commit or share it.\n"
-    "</personal-learnings>"
+    f'<project-rules project="{name}" source="{path}">\n'
+    f"{body}\n"
+    f"{footer}"
+    "</project-rules>"
 )
 PY

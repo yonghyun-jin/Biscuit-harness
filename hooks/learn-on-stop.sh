@@ -1,10 +1,13 @@
 #!/bin/sh
 # Stop hook — before the session ends, intervene ONCE and ask the model to
-# record non-obvious learnings from this session.
+# record non-obvious rules/episodes from this session.
 #
-# The hook script is distributed by the harness (code), but the learnings are
-# personal data: they go to ~/.claude/learnings/<project>.md on THIS machine
-# only — never into any repo, never shared with the team.
+# Rules are PROJECT knowledge and live IN the project repo at
+# <repo>/.claude/rules.md, committed to git — cloning the project is how
+# anyone (and any machine) inherits them. Outside a git repo we fall back to
+# the machine-local legacy path ~/.claude/rules/<project>.md.
+# (Script filename stays learn-on-stop.sh: it is registered by absolute path
+# in settings.json — renaming it silently breaks existing installs.)
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -16,7 +19,7 @@ python3 - "$HOOK_DIR" <<'PY'
 import json, os, sys
 
 sys.path.insert(0, sys.argv[1])
-from _project_name import project_name
+from _project_name import project_name, git_toplevel
 
 try:
     data = json.loads(os.environ.get("BH_HOOK_INPUT") or "{}")
@@ -39,14 +42,31 @@ except OSError:
 cwd = data.get("cwd") or os.getcwd()
 name = project_name(cwd)
 
-target = os.path.join(os.path.expanduser("~/.claude/learnings"), f"{name}.md")
+toplevel = git_toplevel(cwd)
+if toplevel:
+    target = os.path.join(toplevel, ".claude", "rules.md")
+    scope = "repo"
+    sharing_note = (
+        "This file is COMMITTED to the project repo and read by everyone who "
+        "works on this project (their sessions inject it at start). Write only "
+        "knowledge that helps build THIS project; never secrets, credentials, "
+        "or personal information. Do not commit it yourself — it rides along "
+        "with the user's normal commits."
+    )
+else:
+    target = os.path.join(os.path.expanduser("~/.claude/rules"), f"{name}.md")
+    scope = "legacy"
+    sharing_note = (
+        "This directory is not a git repo, so this file is machine-local "
+        "personal memory — never commit it or copy it into a repo."
+    )
 try:
     os.makedirs(os.path.dirname(target), exist_ok=True)
 except OSError:
     sys.exit(0)
 
 reason = (
-    "Before ending this session: if it produced NON-OBVIOUS learnings — gotchas, "
+    "Before ending this session: if it produced NON-OBVIOUS rules or episodes — gotchas, "
     "debugging insights, project quirks, corrections the user gave you, decisions "
     f"and their reasons — record them in {target}. The file has two sections; "
     "CLASSIFY each learning before writing it:\n\n"
@@ -70,20 +90,26 @@ reason = (
     'concrete system/file/symptom. Bad: "## 2026-07-14 — bug fix". Good: '
     '"## 2026-07-14 — Railway healthcheck path misconfig causes restart loop". '
     "(This heading rule applies to episodes only.)\n\n"
+    "For any DECISION made this session (design choice, library pick, "
+    "tradeoff, scope cut), do not record just the outcome — record WHY it was "
+    "made this way, what CONSTRAINTS forced it, and what to BE CAREFUL about "
+    "when touching it later. This file is the project's wiki of decision "
+    "rationale and working rules: future sessions reuse it as context instead "
+    "of re-deriving decisions or accidentally reversing them.\n\n"
     "If the file is new or lacks these sections, create the '# Rules' / "
     "'# Episodes' structure. Read the file first and do not duplicate what is "
     "already there. If the file has grown past ~150 lines, consolidate while "
     "you're there: merge overlapping entries, drop obsolete ones, and PROMOTE "
     "lessons that recur across episodes into # Rules. Only record non-obvious "
     "items (skip anything derivable from the code, docs, or git history); write "
-    "for your future self months from now. This file is the user's personal "
-    "machine-local memory — never commit it or copy it into a repo. "
+    "for whoever builds this project months from now. " + sharing_note + " "
     "If this session genuinely produced nothing worth recording, write nothing "
     "and simply end."
 )
 try:
     from _metric import log_event
-    log_event("learn-on-stop", data.get("session_id", ""), name, {"action": "prompted"})
+    log_event("learn-on-stop", data.get("session_id", ""), name,
+              {"action": "prompted", "target": scope})
 except Exception:
     pass
 
