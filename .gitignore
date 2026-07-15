@@ -1,3 +1,5 @@
 .last-update
 .DS_Store
 __pycache__/
+TODO.md
+.claude/rules.md

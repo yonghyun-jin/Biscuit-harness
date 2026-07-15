@@ -6,8 +6,8 @@ description: |
   APPROVAL → builder → verifier → 3-lens review panel, then report as
   orchestrator (decided / implemented / verified / remaining risks / needs
   human confirmation). Use for non-trivial or ambiguous features where a wrong
-  start is expensive — "orchestrate this", "agent pipeline으로 진행",
-  "리서치부터 돌려줘". For small well-defined tickets, /implement is lighter.
+  start is expensive — "orchestrate this", "run the agent pipeline",
+  "start with research". For small well-defined tickets, /implement is lighter.
 allowed-tools:
   - Bash
   - Read
@@ -77,20 +77,20 @@ human — fixing them re-enters step 4 with approval.
 ### 7. Orchestrator report (final message — match the user's language)
 
 ```
-## 결정한 것 (Decided)
+## Decided
 - <decision> — <why / who decided (human answers, spec choices)>
 
-## 구현한 것 (Implemented)
+## Implemented
 - <file> — <what changed>   (from the builder report)
 
-## 검증한 것 (Verified)
+## Verified
 - <check / acceptance criterion> — <result>   (from the verifier report)
 - Review panel: <n> findings (<worst severity>), checklist NOs: <list or none>
 
-## 남은 리스크 (Remaining risks)
+## Remaining risks
 - <risk> — <why it remains, what would mitigate it>
 
-## 사람이 확인해야 할 것 (Needs human confirmation)
+## Needs human confirmation
 - <item> — <what to look at, how to check it>
 ```
 

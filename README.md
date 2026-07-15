@@ -9,6 +9,83 @@ The point: whatever project you open — especially small ones — the builder
 starts from a working baseline instead of from scratch. Download it and go;
 customize in your own space (see Scope below).
 
+## Getting started — zero to a working baseline
+
+### Step 1 — install on your machine (once, ~1 minute)
+
+Paste this into any Claude Code session:
+
+```
+Install biscuit-harness: run
+git clone --single-branch --depth 1 https://github.com/yonghyun-jin/Biscuit-harness.git ~/.claude/skills/biscuit-harness && ~/.claude/skills/biscuit-harness/setup
+then add a "biscuit-harness" section to my global CLAUDE.md listing the available skills.
+```
+
+Or by hand:
+
+```sh
+git clone --single-branch --depth 1 \
+  https://github.com/yonghyun-jin/Biscuit-harness.git ~/.claude/skills/biscuit-harness
+~/.claude/skills/biscuit-harness/setup
+```
+
+That is the whole install. It wires up, machine-wide:
+
+- skills — `/implement`, `/ticket`, `/scope-creation`, `/orchestrate`
+- agents — researcher / spec / builder / verifier / reviewer
+- hooks — rules loop, type-check feedback, metrics, auto-update
+- baseline deny rules — force-push, `rm -rf /` and friends (added once;
+  remove any and it stays removed)
+
+`setup` is idempotent — re-run it any time. Never edit files under
+`~/.claude/` directly; they are symlinks into the clone.
+
+### Step 2 — use it in your repo (new or existing)
+
+**There is nothing to install per project** — the harness is machine-global.
+
+```sh
+cd your-project
+git init          # only if the directory is brand new — the rules loop needs a repo
+```
+
+Then open a Claude Code session and just work. At the first session's end the
+model writes `.claude/rules.md` (the project's accumulated rules — commit it
+with your normal commits); every later session starts with it injected.
+
+Optional, per repo:
+
+- **Team marker** — nag (or block) teammates whose machine lacks the harness:
+
+  ```sh
+  ~/.claude/skills/biscuit-harness/bin/team-init required   # or: optional
+  git add .claude/ && git commit -m "require biscuit-harness for AI-assisted work"
+  ```
+
+  The marker is one SessionStart hook committed to the project's
+  `.claude/settings.json` — no harness code is vendored into the project.
+  `required` = Claude stops and asks the user to install first;
+  `optional` = a one-line suggestion at session start.
+
+- **Inline-type guardrail** (TS monorepo with apps/ + packages/): create
+  `.claude/harness.json` with `{"check-type-dup": true}`
+
+- **`CLAUDE.md`** — human-curated project facts (how to run, conventions);
+  the built-in `/init` writes a starter
+
+### Step 3 — check it's working
+
+| Check | How |
+|---|---|
+| Installed | `ls ~/.claude/skills/biscuit-harness` |
+| Skills live | type `/orchestrate` (or `/implement`) in a session — it's offered |
+| Rules loop | end one session; `.claude/rules.md` appears, next session injects it |
+| Type hook | edit a `.ts` file in a repo with a tsconfig — errors feed back automatically |
+| Impact | `~/.claude/skills/biscuit-harness/bin/harness-stats` |
+
+Updates are automatic from here: every session start pulls the latest
+(1h throttle) and re-links anything new. No further action ever.
+
 ## Scope — what this provides, and what it never will
 
 Provided (the engine):
@@ -49,43 +126,6 @@ it stays deleted.
 | Harness feature opt-in | `<repo>/.claude/harness.json` | e.g. `{"check-type-dup": true}` |
 | Team-wide custom set | **fork this repo**, add to `skills/` etc. | your fork inherits the whole deployment engine: push = team deploy |
 
-## Install (personal)
-
-Paste this into Claude Code:
-
-```
-Install biscuit-harness: run
-git clone --single-branch --depth 1 https://github.com/yonghyun-jin/Biscuit-harness.git ~/.claude/skills/biscuit-harness && ~/.claude/skills/biscuit-harness/setup
-then add a "biscuit-harness" section to my global CLAUDE.md listing the available skills.
-```
-
-Or by hand:
-
-```sh
-git clone --single-branch --depth 1 \
-  https://github.com/yonghyun-jin/Biscuit-harness.git ~/.claude/skills/biscuit-harness
-~/.claude/skills/biscuit-harness/setup
-```
-
-`setup` is idempotent — re-run it any time (e.g. after new agents/skills are added).
-
-## Team mode
-
-Inside a project repo, plant a marker that nags (or blocks) anyone whose
-machine doesn't have the harness:
-
-```sh
-~/.claude/skills/biscuit-harness/setup --team
-~/.claude/skills/biscuit-harness/bin/team-init required   # or: optional
-git add .claude/ && git commit -m "require biscuit-harness for AI-assisted work"
-```
-
-The marker is a single SessionStart hook committed to the project's
-`.claude/settings.json`. No harness code is vendored into the project.
-
-- `required` — Claude is instructed to stop and have the user install first
-- `optional` — a one-line install suggestion at session start
-
 ## How it works
 
 ```
@@ -101,9 +141,11 @@ git pull  → everything updates in place (no copies, no drift)
 | Hooks  | `~/.claude/settings.json`      | registered by absolute path into this repo |
 
 Auto-update: `setup` registers `hooks/auto-update.sh` as a SessionStart hook.
-It runs `git pull --ff-only` at most once per hour and fails silently when
-offline. Because the hook script itself lives in this repo, improvements to
-the update logic also ship via `git pull`.
+At most once per hour it fetches and fast-forwards, then re-runs `setup` so
+new skills/hooks link automatically. Offline and up-to-date are silent; being
+behind without a possible fast-forward prints a one-line warning. Because the
+hook script itself lives in this repo, improvements to the update logic also
+ship via `git pull`.
 
 **Never edit harness files under `~/.claude/` directly** — the symlinks point
 back into this repo. Change things here and push.
@@ -160,18 +202,6 @@ model-accumulated dynamic knowledge. Don't `@import` rules.md from CLAUDE.md —
 the hook already injects it, an import would double it. `AGENTS.md` (the
 cross-tool instructions standard) is only needed if the team uses non-Claude
 tools; symlink it to CLAUDE.md in that case.
-
-## New project
-
-There is nothing to install per project — the harness is machine-global, so
-hooks and skills already apply. For a brand-new directory, all that matters:
-
-- `git init` first — the rules loop targets the repo's
-  `.claude/rules.md` and needs a repo to exist (the hook creates the file
-  itself on the first session end)
-- team repo? plant the marker: `bin/team-init required|optional`
-- TS monorepo that wants the inline-type guardrail? opt in with
-  `.claude/harness.json` → `{"check-type-dup": true}`
 
 ## Metrics (personal, local — never transmitted)
 

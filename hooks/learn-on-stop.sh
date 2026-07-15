@@ -16,7 +16,7 @@ BH_HOOK_INPUT=$(cat)
 export BH_HOOK_INPUT
 
 python3 - "$HOOK_DIR" <<'PY'
-import json, os, sys
+import json, os, re, sys, tempfile
 
 sys.path.insert(0, sys.argv[1])
 from _project_name import project_name, git_toplevel
@@ -26,18 +26,41 @@ try:
 except Exception:
     sys.exit(0)
 
-# We already intervened once this session — let it end now (no loops).
+# Same stop chain — we just intervened and the model responded; let it end.
 if data.get("stop_hook_active"):
     sys.exit(0)
 
-# Trivial sessions have nothing worth recording — skip short transcripts.
+# Stop fires on EVERY assistant turn, not at session end. Delta re-arm keeps
+# the cost sane: intervene at the first qualifying stop, then again only after
+# the transcript has grown REARM_LINES more — short Q&A turns pass silently,
+# long work sessions still get later interventions. State is one tiny file per
+# session in the OS temp dir (machine-local, self-cleaning).
+REARM_LINES = 200
+
 transcript = data.get("transcript_path") or ""
+lines = -1  # unreadable → fail open: still ask, but never write state
 try:
     with open(transcript) as f:
-        if sum(1 for _ in f) < 20:
-            sys.exit(0)
+        lines = sum(1 for _ in f)
 except OSError:
-    pass  # can't read it — fail open and still ask
+    pass
+
+# Trivial sessions have nothing worth recording — skip short transcripts.
+if 0 <= lines < 20:
+    sys.exit(0)
+
+# Sanitize: session_id becomes a filename — strip separators/NUL so a weird
+# value can neither crash open() nor name a path outside the temp dir.
+session = data.get("session_id") or os.path.basename(transcript) or "unknown"
+session = re.sub(r"[^A-Za-z0-9._-]", "_", session)
+state = os.path.join(tempfile.gettempdir(), f"bh-learn-prompted-{session}")
+if lines >= 0:
+    try:
+        with open(state) as f:
+            if lines - int(f.read().strip() or 0) < REARM_LINES:
+                sys.exit(0)
+    except (OSError, ValueError):
+        pass  # no state yet — first intervention this session
 
 cwd = data.get("cwd") or os.getcwd()
 name = project_name(cwd)
@@ -104,14 +127,28 @@ reason = (
     "items (skip anything derivable from the code, docs, or git history); write "
     "for whoever builds this project months from now. " + sharing_note + " "
     "If this session genuinely produced nothing worth recording, write nothing "
-    "and simply end."
+    "and simply end.\n\n"
+    "REPORT ORDER: do the file edit FIRST, silently — no preamble announcing "
+    "what you are about to record. THEN end your reply with a short record "
+    "report: which section(s) you updated and the gist of each entry, quoting "
+    "episode headings verbatim. If you recorded nothing, the report is one "
+    "line stating that and why. The report is the LAST thing in your reply."
 )
 try:
     from _metric import log_event
     log_event("learn-on-stop", data.get("session_id", ""), name,
-              {"action": "prompted", "target": scope})
+              {"action": "prompted", "target": scope, "transcript_lines": lines})
 except Exception:
     pass
+
+# Record where the transcript stood at this intervention — the next one only
+# fires after REARM_LINES more lines of real work.
+if lines >= 0:
+    try:
+        with open(state, "w") as f:
+            f.write(str(lines))
+    except (OSError, ValueError):
+        pass
 
 print(json.dumps({"decision": "block", "reason": reason}))
 sys.exit(0)
