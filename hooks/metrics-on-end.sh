@@ -28,7 +28,16 @@ try:
 except OSError:
     sys.exit(0)
 
-HARNESS_SKILLS = {"implement", "ticket", "scope-creation"}
+# Harness skills = whatever the repo ships (skills/<name>/SKILL.md), so this
+# never drifts as skills are added or renamed. HOOK_DIR is sys.argv[1].
+skills_dir = os.path.join(os.path.dirname(sys.argv[1]), "skills")
+try:
+    HARNESS_SKILLS = {
+        d for d in os.listdir(skills_dir)
+        if os.path.isfile(os.path.join(skills_dir, d, "SKILL.md"))
+    }
+except OSError:
+    HARNESS_SKILLS = set()
 first_ts = last_ts = None
 user_msgs = asst_msgs = tool_calls = tool_errors = 0
 in_tok = out_tok = cache_tok = skill_uses = 0

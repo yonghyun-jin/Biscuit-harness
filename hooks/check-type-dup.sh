@@ -2,6 +2,10 @@
 # PostToolUse hook (Edit|Write|MultiEdit) — flag new domain interface/type
 # declarations written inline under apps/ in a monorepo that has a packages/
 # dir. Nudges Claude to reuse or relocate the type to packages/shared.
+#
+# OPT-IN per project: the apps/+packages/shared layout is one team's
+# convention, not universal — the hook is inert unless the project has a
+# .claude/harness.json containing {"check-type-dup": true}.
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # The heredoc below occupies stdin, so hand the hook payload to python via env.
@@ -21,6 +25,24 @@ except Exception:
 ti = data.get("tool_input", {})
 path = ti.get("file_path", "") or ""
 if "/apps/" not in path or not path.endswith((".ts", ".tsx")):
+    sys.exit(0)
+
+
+def opted_in(start_dir):
+    d = start_dir
+    while d and d != "/":
+        cfg = os.path.join(d, ".claude", "harness.json")
+        if os.path.isfile(cfg):
+            try:
+                with open(cfg) as f:
+                    return json.load(f).get("check-type-dup") is True
+            except Exception:
+                return False
+        d = os.path.dirname(d)
+    return False
+
+
+if not opted_in(os.path.dirname(path)):
     sys.exit(0)
 
 # Only inspect content added by this tool call, not the whole file
