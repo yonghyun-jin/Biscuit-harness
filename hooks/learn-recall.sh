@@ -39,6 +39,7 @@ HOOK_DIR = sys.argv[1]
 sys.path.insert(0, HOOK_DIR)
 from _project_name import (project_name, rules_root, legacy_rules_path,
                            looks_like_harness_rules, store_key, terminal_counter_path,
+                           adopt_v3_queue, rules_gitignored,
                            UNCLAIMED_DIR, LEARN_ROOT, QUEUE_DIR, MAX_RETRIES, TERMINAL_PAUSE)
 
 try:
@@ -109,9 +110,40 @@ if full and source == "startup":
     except OSError:
         pass
 
+# ---- a repo whose .gitignore swallows .claude/ keeps rules.md on this checkout only
+if full and source == "startup":
+    try:
+        pat = rules_gitignored(rr)
+        if pat:
+            stamp = os.path.join(QUEUE_DIR, f".gitignored-{store_key(rr)}")
+            try:
+                fresh = time.time() - os.path.getmtime(stamp) < 30 * 86400
+            except OSError:
+                fresh = False
+            if not fresh:
+                os.makedirs(QUEUE_DIR, exist_ok=True)
+                open(stamp, "w").close()
+                sections.append((2, (
+                    f"<rules-gitignored>Git ignores {rr['rules']} in this repo (pattern `{pat}`), so the "
+                    "rules this loop accumulates stay on this checkout and never reach other worktrees, "
+                    "clones or teammates. Tell the user once, in one line: to share them, replace the "
+                    "directory pattern with `.claude/*` plus `!.claude/rules.md` (git cannot re-include a "
+                    "file under an excluded directory); to keep them machine-local, do nothing."
+                    "</rules-gitignored>")))
+    except Exception:
+        pass
+
 # ---- background loop: pending candidates, failures, sweep
 if full:
     try:
+        # v3 kept a private queue per worktree; v4 reads the shared one, so adopt leftovers first
+        try:
+            n_adopted = adopt_v3_queue(rr)
+            if n_adopted:
+                card_notes.append(f"moved {n_adopted} candidate(s) from this worktree's pre-v4 queue "
+                                  f"into the shared queue {rr['pending']}")
+        except Exception:
+            pass
         pending_dir = rr["pending"]
         frags = []
         if os.path.isdir(pending_dir):

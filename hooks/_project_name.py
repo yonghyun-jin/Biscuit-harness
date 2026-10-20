@@ -16,6 +16,7 @@
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 
 LEARN_ROOT = os.path.expanduser("~/.claude/learn-rules")
@@ -139,6 +140,78 @@ def store_key(rr):
     anchor = os.path.dirname(rr["pending"])
     h = hashlib.sha1(os.path.realpath(anchor).encode("utf-8", "replace")).hexdigest()[:8]
     return safe_name(os.path.basename(base.rstrip("/")) or "root") + "-" + h
+
+
+
+def adopt_v3_queue(rr):
+    """v3 kept one review queue per worktree (<toplevel>/.claude/rules-pending/);
+    v4 keeps one per repo, in the main worktree. In a linked worktree, move the
+    fragments an old private queue still holds into the shared queue (else
+    they would never be reviewed) and remove the old queue once nothing but
+    its own .gitignore is left. Returns the number of fragments moved."""
+    if rr.get("scope") != "repo" or not rr.get("toplevel"):
+        return 0
+    old = os.path.join(rr["toplevel"], ".claude", "rules-pending")
+    new = rr["pending"]
+    if not os.path.isdir(old) or os.path.realpath(old) == os.path.realpath(new):
+        return 0
+    try:
+        names = sorted(os.listdir(old))
+    except OSError:
+        return 0
+    moved = 0
+    for f in names:
+        if f == ".gitignore":
+            continue
+        # a claim left by a session that never finished: re-queue under its original name
+        orig = f.split("~", 2)[2] if f.startswith(".reviewing~") and f.count("~") >= 2 else f
+        if not orig.endswith(".md") or orig.startswith("."):
+            continue
+        try:
+            os.makedirs(new, exist_ok=True)
+            gi = os.path.join(new, ".gitignore")
+            if not os.path.exists(gi):
+                with open(gi, "w") as fh:
+                    fh.write("*\n")
+            dst = os.path.join(new, orig)
+            n = 1
+            while os.path.exists(dst):
+                n += 1
+                dst = os.path.join(new, f"{orig[:-3]}-wt{n}.md")
+            src = os.path.join(old, f)
+            try:
+                os.replace(src, dst)
+            except OSError:
+                shutil.move(src, dst)
+            moved += 1
+        except OSError:
+            continue
+    try:
+        left = os.listdir(old)
+        if left == [".gitignore"] and open(os.path.join(old, ".gitignore")).read().strip() == "*":
+            os.remove(os.path.join(old, ".gitignore"))
+            left = []
+        if not left:
+            os.rmdir(old)
+    except OSError:
+        pass
+    return moved
+
+
+def rules_gitignored(rr):
+    """'' when this repo's rules.md can travel through git; otherwise the
+    .gitignore pattern that excludes it. An explicit `rules.md` pattern is a
+    deliberate choice and also returns '' (this harness repo keeps its own
+    rules.md machine-local that way)."""
+    if rr.get("scope") != "repo" or not rr.get("toplevel"):
+        return ""
+    out = _git(rr["toplevel"], "check-ignore", "-v", "--", ".claude/rules.md")
+    if not out:
+        return ""  # not ignored (or already tracked)
+    pat = out.split("\t", 1)[0].split(":", 2)[-1].strip()  # <source>:<line>:<pattern>\t<path>
+    if "rules.md" in pat:
+        return ""
+    return pat or out
 
 
 def terminal_counter_path(rr):

@@ -263,6 +263,13 @@ Worktrees share rules.md the way they share any committed file — through
 commits, merges and rebases, not live; only the review queue is shared live.
 Different projects never see each other's rules.
 
+Two upgrade cases the hook handles on its own: a linked worktree's private v3
+queue (`<worktree>/.claude/rules-pending/`) is moved into the shared queue the
+first time a session starts there; and a repo whose `.gitignore` excludes
+`.claude/` wholesale gets a one-line warning (once per 30 days) that rules.md
+cannot travel through git there — use `.claude/*` plus `!.claude/rules.md` to
+keep local settings ignored but share the rules.
+
 **Native opt-in for large rule sets.** The hook injection is capped at 9,500
 bytes. A folder with more standing rules than that can move its `# Rules` tier
 into `<folder>/.claude/rules/biscuit-rules.md`, which Claude Code loads itself

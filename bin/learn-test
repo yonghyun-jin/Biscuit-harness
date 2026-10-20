@@ -371,6 +371,46 @@ os.remove(os.path.join(pend, "h1.md"))
 s2, n2 = _digest.scrub_secrets("az storage blob upload --account-key AccountKey=abcDEFghiJKLmnoPQRstuVWXyz0123456789== ; curl -H 'Authorization: Bearer eyJabcdefghijklmnopqrstuvwxyz0123456789' ; export GH=github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ ; sk-proj-abcdefghijklmnopqrstuvwxyz ; PW: hunter2hunter2 ; curl -u admin:S3cretPass host")
 check("T20 AccountKey / Bearer / github_pat / sk-proj / PW: / curl -u are redacted", n2 >= 6 and "hunter2" not in s2 and "S3cretPass" not in s2 and "AccountKey=abc" not in s2, f"n={n2} {s2[:200]}")
 
+# ---------------------------------------------------------------- T21 v3 per-worktree queue adopted into the shared queue
+repoW = os.path.join(TMP, "repoW"); os.makedirs(repoW)
+subprocess.run(["git", "-C", repoW, "init", "-q"], check=True)
+subprocess.run(["git", "-C", repoW, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                "commit", "-q", "--allow-empty", "-m", "seed"], check=True)
+wtW = os.path.join(TMP, "repoW-wt")
+subprocess.run(["git", "-C", repoW, "worktree", "add", "-q", "-b", "feature", wtW], check=True)
+oldq = os.path.join(wtW, ".claude", "rules-pending"); os.makedirs(oldq)
+open(os.path.join(oldq, ".gitignore"), "w").write("*\n")
+open(os.path.join(oldq, "v3frag.md"), "w").write("# Rules\n- from the old per-worktree queue\n")
+open(os.path.join(oldq, ".reviewing~dead-session~v3claim.md"), "w").write("# Rules\n- claimed by a session that never finished\n")
+rrW = _project_name.rules_root(wtW)
+check("T21 a linked worktree resolves the shared queue in the main worktree",
+      os.path.realpath(rrW["pending"]) == os.path.realpath(os.path.join(repoW, ".claude", "rules-pending")), rrW["pending"])
+r = hook("learn-recall.sh", {"session_id": "sess-wt-0001", "cwd": wtW, "transcript_path": "", "source": "resume"})
+shared = sorted(os.listdir(rrW["pending"])) if os.path.isdir(rrW["pending"]) else []
+check("T21 stranded fragment and stale claim are moved to the shared queue and claimed by this session",
+      ".reviewing~sess-wt-0001~v3frag.md" in shared and ".reviewing~sess-wt-0001~v3claim.md" in shared, str(shared))
+check("T21 the old per-worktree queue is removed once empty", not os.path.exists(oldq))
+check("T21 the review card mentions the adoption", "pre-v4 queue" in r.stdout and 'count="2"' in r.stdout, r.stdout[:200])
+r = hook("learn-recall.sh", {"session_id": "sess-wt-0002", "cwd": wtW, "transcript_path": "", "source": "resume"})
+check("T21 second start: nothing left to adopt, no note", "pre-v4 queue" not in r.stdout)
+
+# ---------------------------------------------------------------- T22 gitignored rules.md → one warning per 30 days
+open(os.path.join(repoW, ".gitignore"), "w").write("node_modules/\n.claude/\n")
+os.makedirs(os.path.join(repoW, ".claude"), exist_ok=True)
+open(os.path.join(repoW, ".claude", "rules.md"), "w").write("# Rules\n- r\n")
+r = hook("learn-recall.sh", {"session_id": "sess-gi-0001", "cwd": repoW, "transcript_path": "", "source": "startup"})
+check("T22 a directory-wide .claude/ ignore pattern triggers the sharing warning",
+      "<rules-gitignored>" in r.stdout and "`.claude/`" in r.stdout, r.stdout[:300])
+r = hook("learn-recall.sh", {"session_id": "sess-gi-0002", "cwd": repoW, "transcript_path": "", "source": "startup"})
+check("T22 the warning is stamped and not repeated on the next startup", "<rules-gitignored>" not in r.stdout)
+stampW = os.path.join(HOME, ".claude", "learn-queue", f".gitignored-{_project_name.store_key(_project_name.rules_root(repoW))}")
+check("T22 stamp lives in the ledger dir, keyed per store", os.path.isfile(stampW), stampW)
+os.remove(stampW)
+open(os.path.join(repoW, ".gitignore"), "w").write(".claude/rules.md\n")
+r = hook("learn-recall.sh", {"session_id": "sess-gi-0003", "cwd": repoW, "transcript_path": "", "source": "startup"})
+check("T22 an explicit rules.md ignore pattern is deliberate: no warning", "<rules-gitignored>" not in r.stdout, r.stdout[:200])
+check("T22 the rules themselves are still injected", "<project-rules" in r.stdout)
+
 # ---------------------------------------------------------------- T14 live (optional)
 if LIVE:
     if not REAL_BIN:
