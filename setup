@@ -7,6 +7,8 @@
 # Usage:
 #   ./setup           personal install
 #   ./setup --team    personal install + print team-mode next steps
+#   ./setup --check   print what is registered, the clone state, the claude
+#                     binary the extractor will use and its working flag set
 #
 # Env:
 #   CLAUDE_DIR   override ~/.claude (used by tests)
@@ -16,11 +18,55 @@ HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 MODE="personal"
 [ "$1" = "--team" ] && MODE="team"
+[ "$1" = "--check" ] && MODE="check"
 
 command -v python3 >/dev/null 2>&1 || {
   echo "setup: python3 is required (macOS: xcode-select --install)" >&2
   exit 1
 }
+
+if [ "$MODE" = "check" ]; then
+  echo "harness:  $HARNESS_DIR"
+  (cd "$HARNESS_DIR" && echo "clone:    $(git rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git rev-parse --short HEAD 2>/dev/null), $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted change(s)")
+  python3 - "$HARNESS_DIR" "$CLAUDE_DIR/settings.json" <<'PY'
+import json, os, sys
+harness, path = sys.argv[1], sys.argv[2]
+try:
+    hooks = json.load(open(path)).get("hooks", {})
+except Exception:
+    hooks = {}
+print("hooks:")
+for ev, entries in hooks.items():
+    for e in entries:
+        for h in e.get("hooks", []):
+            cmd = h.get("command", "")
+            if harness in cmd or cmd.rsplit("/", 1)[-1] in ("learn-on-stop.sh",):
+                extra = f" timeout={h['timeout']}" if "timeout" in h else ""
+                print(f"  {ev:<13} {cmd.rsplit('/', 1)[-1]}{extra}" + (f" matcher={e['matcher']}" if e.get("matcher") else ""))
+legacy = os.path.join(os.path.dirname(path), "rules")
+try:
+    n = sum(1 for f in os.listdir(legacy) if f.endswith(".md"))
+except OSError:
+    n = 0
+print(f"legacy ~/.claude/rules/*.md files (loaded into EVERY project by Claude Code): {n}")
+q = os.path.join(os.path.dirname(path), "learn-queue")
+st = {}
+try:
+    for f in os.listdir(q):
+        if f.endswith(".json") and not f.startswith("caps-"):
+            try:
+                s = json.load(open(os.path.join(q, f))).get("status")
+                st[s] = st.get(s, 0) + 1
+            except Exception:
+                pass
+except OSError:
+    pass
+print("learn-queue:", json.dumps(st))
+PY
+  echo "extractor probe (one tiny headless call):"
+  "$HARNESS_DIR/hooks/learn-extract.sh" --probe 2>&1 | sed 's/^/  /'
+  exit 0
+fi
 
 mkdir -p "$CLAUDE_DIR/agents" "$CLAUDE_DIR/skills"
 chmod +x "$HARNESS_DIR"/hooks/*.sh "$HARNESS_DIR"/bin/* 2>/dev/null || true
@@ -51,7 +97,7 @@ done
 
 # 3. hooks + guardrail deny rules → ~/.claude/settings.json
 python3 - "$HARNESS_DIR" "$CLAUDE_DIR/settings.json" <<'PY'
-import json, sys
+import json, os, re, sys
 
 harness, path = sys.argv[1], sys.argv[2]
 
@@ -65,51 +111,88 @@ except json.JSONDecodeError:
 
 hooks = settings.setdefault("hooks", {})
 
+# Every hook filename the harness ever registered. Used for "already
+# installed" detection (deny rules are added on the first install only) and
+# so a retired hook's entry can be recognised as ours and removed.
 HOOK_BASENAMES = {
     "auto-update.sh", "check-types.sh", "check-type-dup.sh",
-    "learn-on-stop.sh", "learn-recall.sh", "metrics-on-end.sh",
+    "learn-on-stop.sh", "learn-recall.sh", "learn-extract.sh",
+    "metrics-on-end.sh",
 }
+RETIRED = {"learn-on-stop.sh"}  # v4: capture happens only at SessionEnd
 
-# Detected BEFORE registering anything: any harness hook already present means
-# this machine installed before. One-time additions (the guardrail deny rules)
-# are skipped then, so a user's deliberate removal of a rule survives updates —
-# the harness only ever touches entries it created, and only adds them once.
 already_installed = any(
     h.get("command", "").rsplit("/", 1)[-1] in HOOK_BASENAMES
     for ev in hooks.values() for e in ev for h in e.get("hooks", [])
 )
 
-def ensure_hook(event, matcher, command):
+
+def ensure_hook(event, matcher, command, timeout=None):
     # Dedupe by script basename, not full path: a moved/re-cloned harness
-    # repoints the existing entry instead of registering a duplicate.
+    # repoints the existing entry instead of registering a duplicate. The
+    # harness only ever edits the entries it created (basename = ours).
     base = command.rsplit("/", 1)[-1]
     entries = hooks.setdefault(event, [])
     for e in entries:
         for h in e.get("hooks", []):
             cmd = h.get("command", "")
             if cmd.rsplit("/", 1)[-1] == base:
-                if cmd == command:
-                    return False
-                h["command"] = command
-                return True
-    entry = {"hooks": [{"type": "command", "command": command}]}
+                changed = False
+                if cmd != command:
+                    h["command"] = command
+                    changed = True
+                if timeout is not None and h.get("timeout") != timeout:
+                    h["timeout"] = timeout
+                    changed = True
+                if timeout is None and "timeout" in h:
+                    del h["timeout"]
+                    changed = True
+                return changed
+    hook = {"type": "command", "command": command}
+    if timeout is not None:
+        hook["timeout"] = timeout
+    entry = {"hooks": [hook]}
     if matcher:
         entry["matcher"] = matcher
     entries.append(entry)
     return True
 
+
+def remove_hook(event, base):
+    """Remove only hook objects whose command basename is a harness filename;
+    a user's own entry on the same event is never touched."""
+    removed = False
+    entries = hooks.get(event) or []
+    for e in entries:
+        hs = e.get("hooks", [])
+        keep = [h for h in hs if h.get("command", "").rsplit("/", 1)[-1] != base]
+        if len(keep) != len(hs):
+            e["hooks"] = keep
+            removed = True
+    hooks[event] = [e for e in entries if e.get("hooks")]
+    if not hooks[event]:
+        del hooks[event]
+    return removed
+
+
 added = []
+for base in RETIRED:
+    for ev in list(hooks.keys()):
+        if remove_hook(ev, base):
+            added.append(f"{ev}: {base[:-3]} (removed — retired)")
 if ensure_hook("SessionStart", None, f"{harness}/hooks/auto-update.sh"):
     added.append("SessionStart: auto-update")
 if ensure_hook("PostToolUse", "Edit|Write|MultiEdit", f"{harness}/hooks/check-types.sh"):
     added.append("PostToolUse: check-types")
 if ensure_hook("PostToolUse", "Edit|Write|MultiEdit", f"{harness}/hooks/check-type-dup.sh"):
     added.append("PostToolUse: check-type-dup")
-if ensure_hook("Stop", None, f"{harness}/hooks/learn-on-stop.sh"):
-    added.append("Stop: learn-on-stop")
 if ensure_hook("SessionStart", None, f"{harness}/hooks/learn-recall.sh"):
     added.append("SessionStart: learn-recall")
-if ensure_hook("SessionEnd", None, f"{harness}/hooks/metrics-on-end.sh"):
+# SessionEnd's default budget is 1.5 s; both hooks finish in well under a
+# second, the 10 s is a ceiling for slow (network-mounted) folders.
+if ensure_hook("SessionEnd", None, f"{harness}/hooks/learn-extract.sh", timeout=10):
+    added.append("SessionEnd: learn-extract")
+if ensure_hook("SessionEnd", None, f"{harness}/hooks/metrics-on-end.sh", timeout=10):
     added.append("SessionEnd: metrics-on-end")
 
 if not already_installed:
@@ -133,6 +216,37 @@ for a in added:
     print(f"  + {a}")
 if not added:
     print("  = settings.json already up to date")
+
+# Re-arm extraction stores paused after repeated configuration errors.
+claude_dir = os.path.dirname(path)
+q = os.path.join(claude_dir, "learn-queue")
+try:
+    for f in os.listdir(q):
+        if f.startswith(".terminal-"):
+            os.remove(os.path.join(q, f))
+            print("  + re-armed paused extraction store")
+except OSError:
+    pass
+
+# v3 leftovers: harness-shaped files in ~/.claude/rules/ are loaded by Claude
+# Code into EVERY project on this machine. Notice only — moving the user's
+# memory is never automatic.
+legacy = os.path.join(claude_dir, "rules")
+shape = re.compile(r"^(# Rules\b|# Episodes\b|## \d{4}-\d\d-\d\d\s)", re.M)
+n = 0
+try:
+    for f in os.listdir(legacy):
+        if f.endswith(".md"):
+            try:
+                if shape.search(open(os.path.join(legacy, f)).read()):
+                    n += 1
+            except OSError:
+                pass
+except OSError:
+    pass
+if n:
+    print(f"  ! {n} harness-style rules file(s) in {legacy} are loaded into EVERY project; "
+          f"run {harness}/bin/migrate-legacy-rules to move them into per-folder stores")
 PY
 
 echo ""

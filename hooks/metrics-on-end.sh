@@ -1,8 +1,13 @@
 #!/bin/sh
-# SessionEnd hook — append one metrics line per session to
-# ~/.claude/metrics/sessions.jsonl. Pure transcript parsing, no LLM, silent
-# on any failure. Personal machine-local data — never committed or shared.
+# SessionEnd hook — append one metrics line per HUMAN session to
+# ~/.claude/metrics/sessions.jsonl. Pure transcript parsing (shared reader in
+# _digest.py: usage deduplicated by message.id, cheap substring prefilter), no
+# LLM, silent on any failure. Personal machine-local data — never committed.
+# Skips the harness's own headless extractor and other `claude -p` runs so the
+# numbers describe the person's sessions, not the machinery.
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+[ -n "$BH_LEARN_EXTRACT" ] && exit 0
 
 # The heredoc below occupies stdin, so hand the hook payload to python via env.
 BH_HOOK_INPUT=$(cat)
@@ -15,6 +20,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, sys.argv[1])
 from _project_name import project_name
 from _metric import append_line, harness_version
+import _digest
 
 try:
     data = json.loads(os.environ.get("BH_HOOK_INPUT") or "{}")
@@ -23,13 +29,10 @@ except Exception:
 
 transcript = data.get("transcript_path") or ""
 cwd = data.get("cwd") or os.getcwd()
-try:
-    f = open(transcript)
-except OSError:
+if not transcript or not os.path.isfile(transcript):
     sys.exit(0)
 
-# Harness skills = whatever the repo ships (skills/<name>/SKILL.md), so this
-# never drifts as skills are added or renamed. HOOK_DIR is sys.argv[1].
+# Harness skills = whatever the repo ships (skills/<name>/SKILL.md).
 skills_dir = os.path.join(os.path.dirname(sys.argv[1]), "skills")
 try:
     HARNESS_SKILLS = {
@@ -38,50 +41,16 @@ try:
     }
 except OSError:
     HARNESS_SKILLS = set()
-first_ts = last_ts = None
-user_msgs = asst_msgs = tool_calls = tool_errors = 0
-in_tok = out_tok = cache_tok = skill_uses = 0
 
-with f:
-    for line in f:
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        ts = d.get("timestamp")
-        if ts:
-            first_ts = first_ts or ts
-            last_ts = ts
-        t = d.get("type")
-        msg = d.get("message") or {}
-        content = msg.get("content")
-        if t == "assistant":
-            asst_msgs += 1
-            usage = msg.get("usage") or {}
-            in_tok += usage.get("input_tokens") or 0
-            out_tok += usage.get("output_tokens") or 0
-            cache_tok += usage.get("cache_read_input_tokens") or 0
-            if isinstance(content, list):
-                for b in content:
-                    if isinstance(b, dict) and b.get("type") == "tool_use":
-                        tool_calls += 1
-                        if (b.get("name") == "Skill"
-                                and (b.get("input") or {}).get("skill") in HARNESS_SKILLS):
-                            skill_uses += 1
-        elif t == "user":
-            has_text = isinstance(content, str) and bool(content.strip())
-            has_tool_result = False
-            if isinstance(content, list):
-                for b in content:
-                    if isinstance(b, dict):
-                        if b.get("type") == "text" and (b.get("text") or "").strip():
-                            has_text = True
-                        elif b.get("type") == "tool_result":
-                            has_tool_result = True
-                            if b.get("is_error"):
-                                tool_errors += 1
-            if has_text and not has_tool_result and not d.get("isMeta"):
-                user_msgs += 1
+try:
+    st = _digest.session_stats(transcript, HARNESS_SKILLS)
+except Exception:
+    sys.exit(0)
+
+# Human sessions only: started from the CLI with at least one typed prompt.
+if (st["entrypoint"] and st["entrypoint"] != "cli") or st["user_msgs"] == 0:
+    sys.exit(0)
+
 
 def parse_iso(ts):
     try:
@@ -89,8 +58,9 @@ def parse_iso(ts):
     except Exception:
         return None
 
+
 duration_s = 0
-a, b = parse_iso(first_ts or ""), parse_iso(last_ts or "")
+a, b = parse_iso(st["first_ts"] or ""), parse_iso(st["last_ts"] or "")
 if a and b:
     duration_s = max(0, int((b - a).total_seconds()))
 
@@ -99,16 +69,26 @@ append_line("sessions.jsonl", {
     "session_id": data.get("session_id", ""),
     "project": project_name(cwd),
     "harness_version": harness_version(),
+    "claude_version": st["version"],
     "end_reason": data.get("reason", ""),
     "duration_s": duration_s,
-    "user_msgs": user_msgs,
-    "asst_msgs": asst_msgs,
-    "tool_calls": tool_calls,
-    "tool_errors": tool_errors,
-    "input_tokens": in_tok,
-    "output_tokens": out_tok,
-    "cache_read_tokens": cache_tok,
-    "harness_skill_uses": skill_uses,
+    "user_msgs": st["user_msgs"],
+    "asst_msgs": st["api_calls"],
+    "api_calls": st["api_calls"],
+    "tool_calls": st["tool_calls"],
+    "tool_errors": st["tool_errors"],
+    "input_tokens": st["input_tokens"],
+    "cache_creation_tokens": st["cache_creation_tokens"],
+    "cache_read_tokens": st["cache_read_tokens"],
+    "output_tokens": st["output_tokens"],
+    "first_turn_prompt_tokens": st["first_turn_prompt_tokens"],
+    "instructions_user_bytes": st["instructions_user_bytes"],
+    "instructions_project_bytes": st["instructions_project_bytes"],
+    "cost_usd": st["cost_usd"],
+    "models": st["models"],
+    "stop_hook_blocks": st["stop_hook_blocks"],
+    "transcript_bytes": st["bytes"],
+    "harness_skill_uses": st["harness_skill_uses"],
 })
 PY
 exit 0

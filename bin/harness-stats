@@ -6,15 +6,19 @@
 #   harness-stats --by project        group session table by project
 #   harness-stats --since 30          only the last N days
 #
-# Top block answers "what did the harness catch?" (attribution, from
-# hook-events.jsonl). Bottom block answers "is it getting better across
-# versions?" (trend, from sessions.jsonl). friction = tool_errors/tool_calls.
+# Blocks: "what did the harness catch?" (hook-events.jsonl), the learn loop's
+# extractor (cost, yield, failures — from learn-extract events and the
+# ledger), the per-session context tax (bytes of user-level rules Claude Code
+# loaded, first-turn prompt tokens), and the session trend by harness version.
+# Medians, not means: session distributions are long-tailed.
 import argparse
 import json
 import os
+import statistics
 from datetime import datetime, timedelta, timezone
 
 METRICS_DIR = os.path.expanduser("~/.claude/metrics")
+QUEUE_DIR = os.path.expanduser("~/.claude/learn-queue")
 
 
 def read_jsonl(name):
@@ -31,6 +35,15 @@ def read_jsonl(name):
         except OSError:
             continue
     return rows
+
+
+def med(vals, default=0):
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    return statistics.median(vals) if vals else default
+
+
+def fmt_k(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else f"{n:.0f}"
 
 
 def main():
@@ -66,31 +79,68 @@ def main():
         bursts = sum(1 for e in ct_err if e["data"].get("is_burst"))
         dup = [e for e in events if e.get("hook") == "check-type-dup"]
         dup_flagged = sum(len((e.get("data") or {}).get("flagged") or []) for e in dup)
-        prompts = sum(1 for e in events if e.get("hook") == "learn-on-stop")
+        stops = sum(1 for e in events if e.get("hook") == "learn-on-stop")
         recalls = [e for e in events if e.get("hook") == "learn-recall"]
-
         print(f"  type errors caught pre-build (check-types):  {clean_errs}"
               f"  (burst events excluded: {bursts})")
         print(f"  check-types runs (clean/errors):             "
               f"{len(ct) - len(ct_err)}/{len(ct_err)}")
         print(f"  inline domain types flagged (check-type-dup): {dup_flagged}")
-        print(f"  learning prompts at session end:              {prompts}")
+        if stops:
+            print(f"  per-turn Stop-hook interventions (pre-v4):    {stops}")
         if recalls:
-            r = sum((e.get("data") or {}).get("rules_count") or 0 for e in recalls)
-            ep = sum((e.get("data") or {}).get("episodes_count") or 0 for e in recalls)
-            print(f"  learnings injected (avg rules/episodes):     "
-                  f"{r / len(recalls):.1f} / {ep / len(recalls):.1f}")
-        by_session = {}
-        for e in events:
-            sid = e.get("session_id") or "?"
-            by_session[sid] = by_session.get(sid, 0) + 1
-        if by_session:
-            print(f"  avg hook chain per session:                   "
-                  f"{sum(by_session.values()) / len(by_session):.1f}")
+            r = med([(e.get("data") or {}).get("rules_count") for e in recalls])
+            ep = med([(e.get("data") or {}).get("episodes_count") for e in recalls])
+            trunc = sum(1 for e in recalls if (e.get("data") or {}).get("truncated"))
+            ob = [(e.get("data") or {}).get("out_bytes") for e in recalls if (e.get("data") or {}).get("out_bytes")]
+            print(f"  rules injected at session start (median rules/episodes): {r:.0f} / {ep:.0f}"
+                  + (f"; median hook output {fmt_k(med(ob))} B, cut to budget {trunc}×" if ob else ""))
+
+    # ---- extractor block
+    ex = [e for e in events if e.get("hook") == "learn-extract"]
+    print()
+    print("== Learn loop extractor (learn-extract events) ==")
+    if not ex:
+        print("  no extractions recorded yet")
+    else:
+        by = {}
+        for e in ex:
+            a = (e.get("data") or {}).get("action") or "?"
+            by[a] = by.get(a, 0) + 1
+        done = [e for e in ex if (e.get("data") or {}).get("action") == "done"]
+        entries = [(e.get("data") or {}).get("entries") or 0 for e in done]
+        zero = sum(1 for n in entries if n == 0)
+        viol = sum(1 for e in done if (e.get("data") or {}).get("contract") == "violated")
+        costs = [(e.get("data") or {}).get("cost_usd") for e in done]
+        secs = [(e.get("data") or {}).get("secs") for e in done]
+        dig = [(e.get("data") or {}).get("digest_chars") for e in done]
+        vers = sorted({(e.get("data") or {}).get("claude_version") for e in done} - {None})
+        print("  runs by outcome:    " + ", ".join(f"{k} {v}" for k, v in sorted(by.items())))
+        if done:
+            print(f"  yield:              {len(done) - zero}/{len(done)} runs produced candidates "
+                  f"({zero} empty); median {med(entries):.0f} candidates; contract violations {viol}")
+            print(f"  cost per run:       median ${med(costs):.4f} (recorded on {sum(1 for c in costs if c is not None)} runs); "
+                  f"median {med(secs):.0f}s; median digest {fmt_k(med(dig))} chars")
+            if vers:
+                print(f"  claude versions:    {', '.join(str(v) for v in vers)}")
+        # ledger snapshot
+        st = {}
+        try:
+            for f in os.listdir(QUEUE_DIR):
+                if f.endswith(".json") and not f.startswith("caps-"):
+                    try:
+                        s = json.load(open(os.path.join(QUEUE_DIR, f))).get("status")
+                        st[s] = st.get(s, 0) + 1
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+        if st:
+            print("  ledger now:         " + ", ".join(f"{k} {v}" for k, v in sorted(st.items(), key=lambda kv: str(kv[0]))))
 
     print()
     key = "harness_version" if args.by == "version" else "project"
-    print(f"== Sessions by {args.by} (sessions.jsonl) ==")
+    print(f"== Sessions by {args.by} (sessions.jsonl; medians) ==")
     if not sessions:
         print("  no sessions recorded yet")
         return
@@ -99,19 +149,26 @@ def main():
     for s in sessions:
         groups.setdefault(s.get(key) or "?", []).append(s)
 
-    hdr = f"{args.by:<12} {'sessions':>8} {'avg_dur':>8} {'user_msgs':>10} " \
-          f"{'friction':>9} {'skill_uses':>11}"
+    hdr = (f"{args.by:<12} {'sessions':>8} {'dur':>6} {'prompts':>8} {'calls':>6} "
+           f"{'friction':>9} {'ctx@1st':>8} {'rulesKB':>8} {'skills':>7}")
     print("  " + hdr)
     for g, rows in sorted(groups.items(), key=lambda kv: kv[0], reverse=True):
         n = len(rows)
-        dur = sum(r.get("duration_s") or 0 for r in rows) / n
-        msgs = sum(r.get("user_msgs") or 0 for r in rows) / n
-        calls = sum(r.get("tool_calls") or 0 for r in rows)
-        errs = sum(r.get("tool_errors") or 0 for r in rows)
-        friction = f"{errs / calls * 100:.1f}%" if calls else "n/a"
+        dur = med([r.get("duration_s") for r in rows])
+        msgs = med([r.get("user_msgs") for r in rows])
+        calls = med([r.get("api_calls") or r.get("asst_msgs") for r in rows])
+        tc = sum(r.get("tool_calls") or 0 for r in rows)
+        te = sum(r.get("tool_errors") or 0 for r in rows)
+        friction = f"{te / tc * 100:.1f}%" if tc else "n/a"
+        first = [r.get("first_turn_prompt_tokens") for r in rows if r.get("first_turn_prompt_tokens")]
+        ctx = fmt_k(med(first)) if first else "-"
+        ub = [r.get("instructions_user_bytes") for r in rows if r.get("instructions_user_bytes") is not None]
+        rules_kb = f"{med(ub) / 1024:.0f}" if ub else "-"
         skills = sum(r.get("harness_skill_uses") or 0 for r in rows)
-        print(f"  {g:<12} {n:>8} {int(dur // 60):>7}m {msgs:>10.1f} "
-              f"{friction:>9} {skills:>11}")
+        print(f"  {g:<12} {n:>8} {int(dur // 60):>5}m {msgs:>8.0f} {calls:>6.0f} "
+              f"{friction:>9} {ctx:>8} {rules_kb:>8} {skills:>7}")
+    print("  ctx@1st = median first-turn prompt tokens; rulesKB = median user-level rules bytes "
+          "Claude Code loaded (the ~/.claude/rules tax; 0 after migration). Rows before v4 lack both.")
 
 
 if __name__ == "__main__":

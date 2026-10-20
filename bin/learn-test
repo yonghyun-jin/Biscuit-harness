@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# learn-test — scenario tests for the learn loop. Offline by default (no API
+# calls: the runner is driven with BH_LEARN_FAKE_ERROR); --live adds ONE real
+# headless extraction (~$0.002) of a synthetic transcript with a planted rule.
+#
+#   bin/learn-test            run all offline scenarios
+#   bin/learn-test --live     also the real end-to-end extraction
+#   bin/learn-test --keep     keep the temp HOME for inspection
+#
+# Everything runs under a throwaway HOME (ledger, stores, metrics, settings),
+# so the real ~/.claude is never touched (the --live call still uses your real
+# login/keychain through the real binary, with a unique session id).
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HARNESS = os.path.dirname(HERE)
+HOOKS = os.path.join(HARNESS, "hooks")
+LIVE = "--live" in sys.argv
+KEEP = "--keep" in sys.argv
+REAL_HOME = os.environ.get("HOME") or os.path.expanduser("~")
+TMP = tempfile.mkdtemp(prefix="bh-learn-test-")
+HOME = os.path.join(TMP, "home")
+os.makedirs(os.path.join(HOME, ".claude", "learn-queue"))
+REAL_BIN = os.environ.get("CLAUDE_CODE_EXECPATH") or shutil.which("claude") or ""
+
+ENV = {k: v for k, v in os.environ.items()
+       if not (k.startswith("BH_") or k.startswith("CLAUDE_CODE_") or k in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT"))}
+ENV.update({"HOME": HOME, "BH_LEARN_NO_SPAWN": "1", "BH_CLAUDE_BIN": "/usr/bin/true"})
+os.environ["HOME"] = HOME  # so _project_name's store paths match the hooks' view
+sys.path.insert(0, HOOKS)
+import _project_name  # noqa: E402
+import _digest  # noqa: E402
+
+results = []
+
+
+def check(name, cond, detail=""):
+    results.append((name, bool(cond), detail))
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"  — {detail}" if detail and not cond else ""))
+
+
+def run(argv, stdin=None, env=None, timeout=180):
+    return subprocess.run(argv, input=stdin, capture_output=True, text=True,
+                          timeout=timeout, env=env or ENV)
+
+
+def hook(script, payload, env=None):
+    return run([os.path.join(HOOKS, script)], stdin=json.dumps(payload), env=env)
+
+
+def ledger(session):
+    try:
+        return json.load(open(os.path.join(HOME, ".claude", "learn-queue", f"{session}.json")))
+    except Exception:
+        return {}
+
+
+def set_ledger(session, rec):
+    with open(os.path.join(HOME, ".claude", "learn-queue", f"{session}.json"), "w") as f:
+        json.dump(rec, f)
+
+
+def env_with(**kw):
+    e = dict(ENV)
+    e.update({k: str(v) for k, v in kw.items()})
+    return e
+
+
+def make_transcript(path, cwd, session, prompts=3, human=True, secret=False, version="2.1.304"):
+    """A small synthetic Claude Code transcript: typed prompts, assistant text
+    (two lines per message id, like the real format), tool calls, one failed
+    tool result, an ai-title line."""
+    lines = [{"type": "ai-title", "aiTitle": "Fixture session", "sessionId": session}]
+    ts = "2026-10-20T10:00:%02d.000Z"
+    base = {"cwd": cwd, "sessionId": session, "version": version, "isSidechain": False,
+            "entrypoint": "cli" if human else "sdk-cli"}
+    texts = [
+        "Never use port 3000 for the dev server in this repo; always use 5055 because 3000 is "
+        "taken by the corporate proxy. Please remember that. " * 3,
+        "The deploy failed again. Check the Railway logs and tell me what the healthcheck path is. " * 3,
+        "Ok, so the healthcheck must be /healthz not /health — update the config and the runbook. " * 3,
+        "Also the migration order matters: run prisma migrate deploy before the webapp deploy. " * 3,
+    ]
+    if secret:
+        texts[0] += " here is the key sk_live_ABCDEFGHIJKLMNOPQRSTUV do not commit it"
+    for i in range(prompts):
+        u = dict(base, type="user", uuid=str(uuid.uuid4()), timestamp=ts % (i * 4 % 60),
+                 promptSource="typed" if human else "sdk", isMeta=False,
+                 message={"role": "user", "content": texts[i % len(texts)]})
+        lines.append(u)
+        mid = f"msg_{session}_{i}"
+        usage = {"input_tokens": 10, "cache_creation_input_tokens": 1000 + i,
+                 "cache_read_input_tokens": 5000, "output_tokens": 50}
+        lines.append(dict(base, type="assistant", uuid=str(uuid.uuid4()), timestamp=ts % ((i * 4 + 1) % 60),
+                          message={"id": mid, "model": "claude-test", "role": "assistant", "usage": usage,
+                                   "content": [{"type": "thinking", "thinking": "hmm"}]}))
+        lines.append(dict(base, type="assistant", uuid=str(uuid.uuid4()), timestamp=ts % ((i * 4 + 1) % 60),
+                          message={"id": mid, "model": "claude-test", "role": "assistant", "usage": usage,
+                                   "content": [{"type": "text", "text": "Understood. I will use port 5055 and "
+                                                "check the healthcheck path in the Railway config. " * 4}]}))
+        tid = f"toolu_{session}_{i}"
+        lines.append(dict(base, type="assistant", uuid=str(uuid.uuid4()), timestamp=ts % ((i * 4 + 2) % 60),
+                          message={"id": mid + "t", "model": "claude-test", "role": "assistant", "usage": usage,
+                                   "content": [{"type": "tool_use", "id": tid, "name": "Bash",
+                                                "input": {"command": "curl -s localhost:3000/health"}}]}))
+        lines.append(dict(base, type="user", uuid=str(uuid.uuid4()), timestamp=ts % ((i * 4 + 3) % 60),
+                          isMeta=False, message={"role": "user", "content": [
+                              {"type": "tool_result", "tool_use_id": tid, "is_error": True,
+                               "content": "curl: (7) Failed to connect to localhost port 3000"}]}))
+    with open(path, "w") as f:
+        for o in lines:
+            f.write(json.dumps(o, separators=(",", ":")) + "\n")
+    return path
+
+
+# ---------------------------------------------------------------- fixtures
+repoA = os.path.join(TMP, "repoA")
+os.makedirs(repoA)
+subprocess.run(["git", "-C", repoA, "init", "-q"], check=True)
+os.makedirs(os.path.join(repoA, ".claude"))
+with open(os.path.join(repoA, ".claude", "rules.md"), "w") as f:
+    f.write("# Rules\n- Existing: keep secrets out of commits.\n\n# Episodes\n## 2026-01-01 — seed episode\n- seed\n")
+dirA = os.path.join(TMP, "projects", "repoA")
+os.makedirs(dirA)
+sA = "aaaaaaaa-1111-2222-3333-444444444444"
+tA = make_transcript(os.path.join(dirA, sA + ".jsonl"), repoA, sA)
+folderF = os.path.join(TMP, "plain-folder")
+os.makedirs(folderF)
+
+print(f"learn-test: temp HOME {HOME}")
+
+# ---------------------------------------------------------------- T0 stop stub
+r = hook("learn-on-stop.sh", {"session_id": sA, "cwd": repoA, "transcript_path": tA, "stop_hook_active": False})
+check("T0 retired Stop hook is a silent exit-0 stub", r.returncode == 0 and not r.stdout.strip(), r.stdout[:80])
+
+# ---------------------------------------------------------------- T1 hook speed + detached spawn
+e = env_with(BH_LEARN_FAKE_ERROR="crash")
+e.pop("BH_LEARN_NO_SPAWN")
+t0 = time.time()
+r = hook("learn-extract.sh", {"session_id": sA, "cwd": repoA, "transcript_path": tA, "reason": "prompt_input_exit"}, env=e)
+dt = time.time() - t0
+check("T1 SessionEnd hook returns fast (< 1.0 s) and exit 0", r.returncode == 0 and dt < 1.0, f"{dt:.2f}s rc={r.returncode} {r.stderr[:120]}")
+for _ in range(40):
+    if ledger(sA).get("status") == "failed":
+        break
+    time.sleep(0.5)
+rec = ledger(sA)
+check("T1 detached runner ran (crash → status failed, retries 0, end_reason kept)",
+      rec.get("status") == "failed" and int(rec.get("retries") or 0) == 0 and rec.get("end_reason") == "prompt_input_exit", json.dumps(rec)[:200])
+
+# ---------------------------------------------------------------- T6 retries → exhausted → warning
+for n in (1, 2):
+    hook("learn-extract.sh", {"session_id": sA, "cwd": repoA, "transcript_path": tA}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+rec = ledger(sA)
+check("T6 crash retried twice (retries == 2)", rec.get("status") == "failed" and int(rec.get("retries") or 0) == 2, json.dumps(rec)[:160])
+hook("learn-extract.sh", {"session_id": sA, "cwd": repoA, "transcript_path": tA}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T6 exhausted job is not re-claimed", int(ledger(sA).get("retries") or 0) == 2)
+r = hook("learn-recall.sh", {"session_id": "s-warn", "cwd": repoA, "transcript_path": tA, "source": "resume"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T6 recall warns about the exhausted job", "<rules-extract-warning>" in r.stdout, r.stdout[:200])
+
+# ---------------------------------------------------------------- T2 non-human, T3 trivial
+sN = "nnnnnnnn-1111-2222-3333-444444444444"
+tN = make_transcript(os.path.join(dirA, sN + ".jsonl"), repoA, sN, human=False)
+run([os.path.join(HOOKS, "learn-extract.sh"), "--run", sN, repoA, tN, "0", "0"], env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T2 headless (sdk) session is skipped as non-human", str(ledger(sN).get("reason", "")).startswith("non-human"), json.dumps(ledger(sN))[:160])
+sT = "tttttttt-1111-2222-3333-444444444444"
+tT = make_transcript(os.path.join(dirA, sT + ".jsonl"), repoA, sT, prompts=1)
+with open(tT) as f:
+    small = [json.loads(l) for l in f]
+with open(tT, "w") as f:  # shrink the one prompt to make it trivial
+    for o in small:
+        if o.get("type") == "user" and isinstance((o.get("message") or {}).get("content"), str):
+            o["message"]["content"] = "hi"
+        if o.get("type") == "assistant":
+            for b in o["message"]["content"]:
+                if b.get("type") == "text":
+                    b["text"] = "hello"
+        f.write(json.dumps(o, separators=(",", ":")) + "\n")
+run([os.path.join(HOOKS, "learn-extract.sh"), "--run", sT, repoA, tT, "0", "0"], env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T3 trivial session → done with 0 entries, no call", ledger(sT).get("status") == "done" and ledger(sT).get("reason") == "trivial", json.dumps(ledger(sT))[:160])
+
+# ---------------------------------------------------------------- T4 usage limit → deferred + backoff
+sD = "dddddddd-1111-2222-3333-444444444444"
+tD = make_transcript(os.path.join(dirA, sD + ".jsonl"), repoA, sD)
+run([os.path.join(HOOKS, "learn-extract.sh"), "--run", sD, repoA, tD, "0", "0"], env=env_with(BH_LEARN_FAKE_ERROR="429"))
+rec = ledger(sD)
+backoff = os.path.join(HOME, ".claude", "learn-queue", ".backoff")
+check("T4 429 → deferred, backoff stamp written, no retry burned",
+      rec.get("status") == "deferred" and os.path.exists(backoff) and int(rec.get("retries") or 0) == 0, json.dumps(rec)[:160])
+hook("learn-extract.sh", {"session_id": sD, "cwd": repoA, "transcript_path": tD}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T4 deferred job is not re-claimed before the backoff expires", ledger(sD).get("status") == "deferred")
+rec = ledger(sD); rec["ts"] = int(time.time()) - 4000; set_ledger(sD, rec); os.remove(backoff)
+hook("learn-extract.sh", {"session_id": sD, "cwd": repoA, "transcript_path": tD}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T4 deferred job is re-claimed after the backoff (then our fake crash → failed)", ledger(sD).get("status") == "failed", json.dumps(ledger(sD))[:160])
+
+# ---------------------------------------------------------------- T5 terminal ×3 → paused → setup re-arms
+rr = _project_name.rules_root(repoA)
+key = _project_name.store_key(rr)
+counter = os.path.join(HOME, ".claude", "learn-queue", f".terminal-{key}")
+for i in range(3):
+    s = f"ffffff{i:02d}-1111-2222-3333-444444444444"
+    t = make_transcript(os.path.join(dirA, s + ".jsonl"), repoA, s)
+    run([os.path.join(HOOKS, "learn-extract.sh"), "--run", s, repoA, t, "0", "0"], env=env_with(BH_LEARN_FAKE_ERROR="flag"))
+check("T5 flag error → terminal, counter reaches 3", ledger(s).get("status") == "terminal" and open(counter).read().strip() == "3", f"{ledger(s).get('status')}")
+sP = "pppppppp-1111-2222-3333-444444444444"
+tP = make_transcript(os.path.join(dirA, sP + ".jsonl"), repoA, sP)
+run([os.path.join(HOOKS, "learn-extract.sh"), "--run", sP, repoA, tP, "0", "0"], env=env_with(BH_LEARN_FAKE_ERROR="flag"))
+check("T5 paused store skips extraction without a call", ledger(sP).get("status") == "paused", json.dumps(ledger(sP))[:120])
+r = hook("learn-recall.sh", {"session_id": "s-paused", "cwd": repoA, "transcript_path": tA, "source": "resume"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T5 recall reports the pause", "PAUSED" in r.stdout, r.stdout[:200])
+seed = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/hooks/learn-on-stop.sh"}]},
+                          {"hooks": [{"type": "command", "command": "/x/cc-status"}]}]}}
+with open(os.path.join(HOME, ".claude", "settings.json"), "w") as f:
+    json.dump(seed, f)
+r = run([os.path.join(HARNESS, "setup")], env=env_with(CLAUDE_DIR=os.path.join(HOME, ".claude")))
+check("T5 setup re-arms the paused store", r.returncode == 0 and not os.path.exists(counter), r.stdout[-200:] + r.stderr[-200:])
+settings = json.load(open(os.path.join(HOME, ".claude", "settings.json")))
+stop_cmds = [h["command"] for e in settings["hooks"].get("Stop", []) for h in e["hooks"]]
+check("T5 setup removed the retired Stop entry and kept the user's", stop_cmds == ["/x/cc-status"], str(stop_cmds))
+se = [(h["command"].rsplit("/", 1)[-1], h.get("timeout")) for e in settings["hooks"]["SessionEnd"] for h in e["hooks"]]
+check("T5 setup registered SessionEnd hooks with a 10 s ceiling", ("learn-extract.sh", 10) in se and ("metrics-on-end.sh", 10) in se, str(se))
+r2 = run([os.path.join(HARNESS, "setup")], env=env_with(CLAUDE_DIR=os.path.join(HOME, ".claude")))
+check("T5 setup is idempotent", "already up to date" in r2.stdout, r2.stdout[-160:])
+run([os.path.join(HOOKS, "learn-extract.sh"), "--run", sP, repoA, tP, "0", "0"], env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T5 after re-arm the paused job runs again", ledger(sP).get("status") == "failed", json.dumps(ledger(sP))[:120])
+
+# ---------------------------------------------------------------- T7 duplicate claim, T8 delta on resume
+sR = "rrrrrrrr-1111-2222-3333-444444444444"
+tR = make_transcript(os.path.join(dirA, sR + ".jsonl"), repoA, sR)
+set_ledger(sR, {"status": "running", "ts": int(time.time()), "retries": 0})
+hook("learn-extract.sh", {"session_id": sR, "cwd": repoA, "transcript_path": tR}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T7 a fresh running job is not claimed twice", ledger(sR).get("status") == "running")
+n_lines = sum(1 for _ in open(tR))
+set_ledger(sR, {"status": "done", "ts": int(time.time()), "retries": 0, "lines_at_extract": n_lines, "entries": 2})
+hook("learn-extract.sh", {"session_id": sR, "cwd": repoA, "transcript_path": tR}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T8 done job with an unchanged transcript is left alone", ledger(sR).get("status") == "done")
+with open(tR, "a") as f:
+    for _ in range(60):
+        f.write(json.dumps({"type": "user", "promptSource": "typed", "entrypoint": "cli", "cwd": repoA,
+                            "message": {"role": "user", "content": "resumed: also the cron uses UTC. " * 8}},
+                           separators=(",", ":")) + "\n")
+hook("learn-extract.sh", {"session_id": sR, "cwd": repoA, "transcript_path": tR}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+rec = ledger(sR)
+check("T8 resumed session (transcript grew) is re-extracted as a delta from the old line count",
+      rec.get("deltas") == 1 and rec.get("since_line") == n_lines, json.dumps(rec)[:200])
+
+# ---------------------------------------------------------------- T9 sweep: lock + crash pickup
+dirB = os.path.join(TMP, "projects", "repoB"); os.makedirs(dirB)
+repoB = os.path.join(TMP, "repoB"); os.makedirs(repoB); subprocess.run(["git", "-C", repoB, "init", "-q"], check=True)
+sB = "bbbbbbbb-1111-2222-3333-444444444444"
+tB = make_transcript(os.path.join(dirB, sB + ".jsonl"), repoB, sB)
+old = time.time() - 9000
+os.utime(tB, (old, old))
+lock = os.path.join(HOME, ".claude", "learn-queue", ".sweep.lock")
+open(lock, "w").write("x")
+run([os.path.join(HOOKS, "learn-extract.sh"), "--sweep", repoB, dirB, "none.jsonl"], env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T9 a held sweep lock makes a second sweep back off", not ledger(sB))
+os.utime(lock, (old, old))  # stale lock
+run([os.path.join(HOOKS, "learn-extract.sh"), "--sweep", repoB, dirB, "none.jsonl"], env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T9 sweep picks up a crashed session (no SessionEnd) with a stale lock", ledger(sB).get("status") == "failed", json.dumps(ledger(sB))[:120])
+check("T9 sweep releases its lock", not os.path.exists(lock))
+sL = "llllllll-1111-2222-3333-444444444444"
+tL = make_transcript(os.path.join(dirB, sL + ".jsonl"), repoB, sL)  # fresh mtime = possibly live
+run([os.path.join(HOOKS, "learn-extract.sh"), "--sweep", repoB, dirB, "none.jsonl"], env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T9 sweep leaves a recently written (possibly live) transcript alone", not ledger(sL))
+
+# ---------------------------------------------------------------- T10 recall budget (Korean, 40 KB)
+rrF = _project_name.rules_root(folderF)
+os.makedirs(rrF["root"], exist_ok=True)
+with open(rrF["rules"], "w") as f:
+    f.write("# Rules\n")
+    for i in range(60):
+        f.write(f"- 규칙 {i}: 한글로 쓴 긴 규칙입니다. 이 규칙은 테스트용이며 바이트 예산을 넘기기 위해 충분히 깁니다. 절대 삭제하지 마세요. 항상 확인하세요. {i}\n")
+    f.write("\n# Episodes\n")
+    for i in range(30):
+        f.write(f"## 2026-{(i % 12) + 1:02d}-{(i % 28) + 1:02d} — 에피소드 {i} 제목\n- 내용 {i}\n")
+r = hook("learn-recall.sh", {"session_id": "s-budget", "cwd": folderF, "transcript_path": tA, "source": "resume"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+out = r.stdout
+ob = len(out.encode("utf-8"))
+check("T10 recall output ≤ 9,500 bytes for a 40 KB Korean store", 0 < ob <= 9500, f"{ob} bytes")
+check("T10 closing tag present (no silent preview)", "</project-rules>" in out)
+check("T10 all 30 episode headings kept in the index", out.count("— 에피소드 ") == 30, str(out.count("— 에피소드 ")))
+check("T10 rules cut at a bullet boundary with an explicit pointer", "more rules not shown" in out)
+check("T10 consolidation requested (size trigger)", "<rules-consolidation" in out)
+check("T10 non-git folder uses the per-folder store (never ~/.claude/rules)", rrF["root"].startswith(os.path.join(HOME, ".claude", "learn-rules")) and 'scope="local"' in out)
+
+# ---------------------------------------------------------------- T11 review-claim: no double review
+pend = rr["pending"]; os.makedirs(pend, exist_ok=True)
+for n in ("frag1.md", "frag2.md"):
+    open(os.path.join(pend, n), "w").write("# Rules\n- candidate\n")
+r1 = hook("learn-recall.sh", {"session_id": "sess-one-1111", "cwd": repoA, "transcript_path": tA, "source": "resume"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T11 first session claims both fragments", r1.stdout.count(".reviewing~sess-one-1111~") == 2 and 'count="2"' in r1.stdout, r1.stdout[:200])
+r2 = hook("learn-recall.sh", {"session_id": "sess-two-2222", "cwd": repoA, "transcript_path": tA, "source": "resume"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T11 a concurrent second session sees no pending fragments", "<rules-pending" not in r2.stdout)
+for f in os.listdir(pend):
+    if f.startswith(".reviewing~"):
+        p = os.path.join(pend, f); os.utime(p, (old, old))
+r3 = hook("learn-recall.sh", {"session_id": "sess-three-3333", "cwd": repoA, "transcript_path": tA, "source": "resume"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T11 stale claims are re-queued and claimed by the next session", r3.stdout.count(".reviewing~sess-three-3333~") == 2, r3.stdout[:200])
+r4 = hook("learn-recall.sh", {"session_id": "sess-four-4444", "cwd": repoA, "transcript_path": tA, "source": "compact"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T11 compact re-injects rules + index only (no ceremony)", "<project-rules" in r4.stdout and "<rules-pending" not in r4.stdout)
+r5 = hook("learn-recall.sh", {"session_id": "sess-five-5555", "cwd": repoA, "transcript_path": tA, "source": "fork"}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+check("T11 fork injects nothing", not r5.stdout.strip())
+
+# ---------------------------------------------------------------- T12 metrics dedupe + human-only
+r = hook("metrics-on-end.sh", {"session_id": sA, "cwd": repoA, "transcript_path": tA, "reason": "other"})
+rows = [json.loads(l) for l in open(os.path.join(HOME, ".claude", "metrics", "sessions.jsonl"))]
+row = rows[-1] if rows else {}
+check("T12 metrics: api_calls deduplicated by message id (6 for 3 prompts)", row.get("api_calls") == 6 and row.get("user_msgs") == 3, json.dumps(row)[:200])
+check("T12 metrics: cache writes recorded, tool errors counted", row.get("cache_creation_tokens") == 6006 and row.get("tool_errors") == 3, json.dumps(row)[:200])
+n_before = len(rows)
+hook("metrics-on-end.sh", {"session_id": sN, "cwd": repoA, "transcript_path": tN, "reason": "other"})
+rows = [json.loads(l) for l in open(os.path.join(HOME, ".claude", "metrics", "sessions.jsonl"))]
+check("T12 metrics: headless session writes no row", len(rows) == n_before)
+
+# ---------------------------------------------------------------- T13 secret scrub in the digest
+sS = "ssssssss-1111-2222-3333-444444444444"
+tS = make_transcript(os.path.join(dirA, sS + ".jsonl"), repoA, sS, secret=True)
+text, info = _digest.build_digest(tS)
+check("T13 digest redacts a planted live key", "sk_live_" not in text and info["scrubbed"] >= 1, f"scrubbed={info['scrubbed']}")
+check("T13 digest keeps the typed prompts and the failed tool result", info["typed_prompts"] == 3 and "[tool error]" in text)
+
+# ---------------------------------------------------------------- T14 live (optional)
+if LIVE:
+    if not REAL_BIN:
+        check("T14 live extraction (no claude binary found)", False)
+    else:
+        live_env = {k: v for k, v in os.environ.items() if not k.startswith("BH_")}
+        live_env["BH_LEARN_NO_SPAWN"] = "1"
+        live_env["BH_CLAUDE_BIN"] = REAL_BIN
+        live_env["HOME"] = REAL_HOME
+        sid = f"learn-test-live-{uuid.uuid4().hex[:8]}"
+        repoL = os.path.join(TMP, "repoL"); os.makedirs(repoL); subprocess.run(["git", "-C", repoL, "init", "-q"], check=True)
+        tL2 = make_transcript(os.path.join(TMP, sid + ".jsonl"), repoL, sid)
+        t0 = time.time()
+        run([os.path.join(HOOKS, "learn-extract.sh"), "--run", sid, repoL, tL2, "0", "0"], env=live_env, timeout=400)
+        qp = os.path.join(REAL_HOME, ".claude", "learn-queue", f"{sid}.json")
+        try:
+            rec = json.load(open(qp))
+        except Exception:
+            rec = {}
+        frag_dir = os.path.join(repoL, ".claude", "rules-pending")
+        frags = [f for f in os.listdir(frag_dir) if f.endswith(".md")] if os.path.isdir(frag_dir) else []
+        body = open(os.path.join(frag_dir, frags[0])).read() if frags else ""
+        check("T14 live: one real extraction completed (status done, 1 turn)",
+              rec.get("status") == "done" and rec.get("num_turns") == 1, json.dumps(rec)[:240])
+        check("T14 live: the planted rule (port 5055) was captured", "5055" in body, body[:200])
+        check("T14 live: cost under $0.02", (rec.get("cost_usd") or 1) < 0.02, str(rec.get("cost_usd")))
+        print(f"       live run: {time.time() - t0:.0f}s, cost ${rec.get('cost_usd')}, entries {rec.get('entries')}")
+        try:
+            os.remove(qp)
+        except OSError:
+            pass
+
+# ---------------------------------------------------------------- summary
+fails = [r for r in results if not r[1]]
+print(f"\n{len(results) - len(fails)}/{len(results)} checks passed")
+if KEEP or fails:
+    print(f"temp HOME kept at {TMP}")
+else:
+    shutil.rmtree(TMP, ignore_errors=True)
+sys.exit(1 if fails else 0)

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+# migrate-legacy-rules — move pre-v4 harness memory files out of ~/.claude/rules/.
+#
+# Why: Claude Code loads EVERY file in ~/.claude/rules/ into EVERY project on the
+# machine (user-level rules). The v3 Stop hook wrote per-folder memory there, so
+# every session on this machine paid for every other folder's notes (measured:
+# ~123K tokens per API call before a manual condense, ~29K after).
+#
+# What it does: for each ~/.claude/rules/<name>.md that has the harness shape
+# (# Rules / # Episodes / dated ## headings) AND that the harness's own metrics
+# log shows it wrote (learn-on-stop target=legacy), find the folder it belongs
+# to and propose a per-folder store:
+#     ~/.claude/learn-rules/<name>-<hash8>/rules.md      (folder found)
+#     ~/.claude/learn-rules/_unclaimed/<name>.md          (no folder found —
+#         attached automatically the next time a session starts in a folder
+#         with that basename)
+# Files that are not harness-shaped, or that the log never mentions, are
+# LISTED and never moved: they may be the user's own global rules.
+#
+#   migrate-legacy-rules            dry run: print the table
+#   migrate-legacy-rules --apply    move the files (os.replace, never overwrites)
+#   migrate-legacy-rules --only <name>[,<name>]   restrict to some files
+#
+# Every move is recorded in ~/.claude/learn-rules/MIGRATED.md (old → new), so
+# any file can be put back by hand. ~/.claude/rules-archive/ is untouched.
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "hooks"))
+from _project_name import (LEARN_ROOT, UNCLAIMED_DIR, LEGACY_RULES_DIR,
+                           looks_like_harness_rules, store_dir)
+
+METRICS = os.path.expanduser("~/.claude/metrics")
+PROJECTS = os.path.expanduser("~/.claude/projects")
+SKIP_DIRS = {"Library", "node_modules", ".git", ".Trash", ".cache", ".npm", ".cargo",
+             ".venv", "venv", "__pycache__", ".next", "dist", "build", "Applications"}
+MAX_DEPTH = 7
+
+
+def legacy_project_names():
+    """Names the v3 Stop hook wrote (hook-events.jsonl, both live and rotated)."""
+    names = set()
+    for fn in ("hook-events.1.jsonl", "hook-events.jsonl"):
+        try:
+            with open(os.path.join(METRICS, fn)) as f:
+                for line in f:
+                    if '"learn-on-stop"' not in line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    if e.get("hook") == "learn-on-stop" and (e.get("data") or {}).get("target") == "legacy":
+                        names.add(e.get("project") or "")
+        except OSError:
+            continue
+    return names
+
+
+def is_git(path):
+    d = path
+    while True:
+        if os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+def known_cwds():
+    """cwd values recorded in transcripts (exact, unlike the lossy dir names)."""
+    cwds = {}
+    try:
+        dirs = os.listdir(PROJECTS)
+    except OSError:
+        return cwds
+    for d in dirs:
+        p = os.path.join(PROJECTS, d)
+        try:
+            files = [os.path.join(p, f) for f in os.listdir(p) if f.endswith(".jsonl")]
+        except OSError:
+            continue
+        for fp in files[:5]:
+            try:
+                with open(fp, "rb") as f:
+                    for _ in range(300):
+                        raw = f.readline()
+                        if not raw:
+                            break
+                        if b'"cwd"' not in raw:
+                            continue
+                        try:
+                            o = json.loads(raw)
+                        except Exception:
+                            continue
+                        c = o.get("cwd")
+                        if c:
+                            cwds[c] = max(cwds.get(c, 0), os.path.getmtime(fp))
+                            break
+            except OSError:
+                continue
+    return cwds
+
+
+def find_folders(name, home):
+    """Folders whose basename equals `name`, non-git, depth-limited walk of ~."""
+    hits = []
+    if os.path.basename(home) == name:
+        hits.append(home)
+    for root, dirs, _files in os.walk(home):
+        depth = root[len(home):].count(os.sep)
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        if depth >= MAX_DEPTH:
+            dirs[:] = []
+            continue
+        for d in list(dirs):
+            if d == name:
+                hits.append(os.path.join(root, d))
+    return hits
+
+
+def main():
+    apply = "--apply" in sys.argv
+    only = set()
+    if "--only" in sys.argv:
+        i = sys.argv.index("--only")
+        if i + 1 < len(sys.argv):
+            only = {x.strip() for x in sys.argv[i + 1].split(",")}
+    home = os.path.expanduser("~")
+    try:
+        files = sorted(f for f in os.listdir(LEGACY_RULES_DIR) if f.endswith(".md"))
+    except OSError:
+        print(f"nothing to do: {LEGACY_RULES_DIR} does not exist")
+        return 0
+    if not files:
+        print(f"nothing to do: no .md files in {LEGACY_RULES_DIR}")
+        return 0
+    logged = legacy_project_names()
+    cwds = known_cwds()
+    rows, refs = [], {}
+    contents = {}
+    for f in files:
+        name = f[:-3]
+        p = os.path.join(LEGACY_RULES_DIR, f)
+        try:
+            text = open(p).read()
+        except OSError:
+            continue
+        contents[name] = text
+        shaped = looks_like_harness_rules(text)
+        in_log = name in logged
+        if only and name not in only:
+            rows.append((f, len(text), "skip", "(not selected)", "")); continue
+        if not shaped or not in_log:
+            why = "not harness-shaped" if not shaped else "never written by the harness (no metrics evidence)"
+            rows.append((f, len(text), "keep", f"stays global — {why}", "")); continue
+        folders = [c for c in find_folders(name, home) if not is_git(c)]
+        # prefer a folder with transcripts (recent first)
+        folders.sort(key=lambda c: cwds.get(c, 0), reverse=True)
+        if folders:
+            target = os.path.join(store_dir(folders[0]), "rules.md")
+            note = f"{folders[0]}" + (f" (+{len(folders) - 1} other same-named folder(s))" if len(folders) > 1 else "")
+            rows.append((f, len(text), "move", target, note))
+        else:
+            rows.append((f, len(text), "move", os.path.join(UNCLAIMED_DIR, f), "no folder found — attached on first session there"))
+    # cross references between files (they cite each other by basename)
+    names = set(contents)
+    for name, text in contents.items():
+        for other in names:
+            if other != name and re.search(r"\b" + re.escape(other) + r"\.md\b", text):
+                refs.setdefault(name, []).append(other)
+
+    w = max(len(r[0]) for r in rows) + 2
+    print(f"{'file':<{w}}{'bytes':>7}  action  target / note")
+    for f, n, action, target, note in rows:
+        line = f"{f:<{w}}{n:>7}  {action:<6}  {target}"
+        if note:
+            line += f"\n{'':<{w}}{'':>7}          {note}"
+        r = refs.get(f[:-3])
+        if r:
+            line += f"\n{'':<{w}}{'':>7}          references: {', '.join(x + '.md' for x in r)}"
+        print(line)
+    moves = [r for r in rows if r[2] == "move"]
+    print(f"\n{len(moves)} file(s) to move, {sum(1 for r in rows if r[2] == 'keep')} kept global.")
+    if not apply:
+        print("Dry run. Re-run with --apply to move them (each move is logged to "
+              f"{os.path.join(LEARN_ROOT, 'MIGRATED.md')}).")
+        return 0
+    os.makedirs(LEARN_ROOT, exist_ok=True)
+    manifest = os.path.join(LEARN_ROOT, "MIGRATED.md")
+    import time
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    moved = 0
+    with open(manifest, "a") as m:
+        for f, n, action, target, note in moves:
+            src = os.path.join(LEGACY_RULES_DIR, f)
+            if os.path.exists(target):
+                print(f"  ! {f}: target exists, not overwriting: {target}")
+                continue
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                os.replace(src, target)
+                m.write(f"- {stamp}  {src}  →  {target}\n")
+                moved += 1
+                print(f"  moved {f} → {target}")
+            except OSError as e:
+                print(f"  ! {f}: {e}")
+    print(f"\nmoved {moved} file(s). Manifest: {manifest}")
+    print("Each file now loads only in its own folder (SessionStart hook). To keep one global "
+          "again, move it back to ~/.claude/rules/ or fold it into ~/.claude/CLAUDE.md.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
