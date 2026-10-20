@@ -50,25 +50,23 @@ import glob, json, os, re, shutil, subprocess, sys, tempfile, time
 HOOK_DIR = sys.argv[1]
 ARGS = sys.argv[2:]
 sys.path.insert(0, HOOK_DIR)
-from _project_name import project_name, rules_root, safe_name, store_key
+from _project_name import (project_name, rules_root, safe_name, store_key,
+                           terminal_counter_path, QUEUE_DIR, MAX_RETRIES, TERMINAL_PAUSE)
 import _digest
 
-QUEUE_DIR = os.path.expanduser("~/.claude/learn-queue")
 SCRIPT = os.path.join(HOOK_DIR, "learn-extract.sh")
 PROMPT_FILE = os.path.join(HOOK_DIR, "learn-extract-prompt.md")
 MODEL = os.environ.get("BH_LEARN_MODEL") or "claude-haiku-5-5"  # pinned: the 'haiku' alias drifts
 BUDGET_USD = os.environ.get("BH_LEARN_BUDGET_USD") or "0.10"
-MAX_RETRIES = 2          # runner crashes only
 STALE_SECS = 600         # a "running" job untouched this long is a dead runner
 LIVE_SECS = 7200         # sweep: a transcript touched this recently may be live
 BACKOFF_SECS = 3600      # after a usage-limit / network error
 DELTA_LINES = 50         # re-extract a done session whose transcript grew this much
 MIN_PROMPTS = 1          # typed human prompts below this = trivial
 MIN_DIGEST_CHARS = 1500
-DIGEST_MAX_CHARS = 200_000
+DIGEST_MAX_BYTES = 200_000  # UTF-8 bytes of digest sent to the model
 RULES_MAX_CHARS = 40_000
 SWEEP_MAX_RUNS = 5
-TERMINAL_PAUSE = 3       # consecutive terminal failures that pause a store
 CALL_TIMEOUT = 300
 PRUNE_DAYS = 30
 
@@ -111,6 +109,11 @@ def finish(session, status, **extra):
     rec = read_rec(session)
     rec["status"] = status
     rec["ts"] = now()
+    if status == "deferred":
+        rec["deferrals"] = int(rec.get("deferrals") or 0) + 1
+        rec.setdefault("deferred_since", rec["ts"])
+    elif status in ("done", "failed", "terminal", "skipped"):
+        rec.pop("deferred_since", None)
     rec.update(extra)
     write_rec(session, rec)
 
@@ -126,14 +129,14 @@ def log(project, session, data):
 
 def paused(rr):
     try:
-        with open(os.path.join(QUEUE_DIR, f".terminal-{store_key(rr)}")) as f:
+        with open(terminal_counter_path(rr)) as f:
             return int(f.read().strip() or 0) >= TERMINAL_PAUSE
     except Exception:
         return False
 
 
 def bump_terminal(rr, reset=False):
-    p = os.path.join(QUEUE_DIR, f".terminal-{store_key(rr)}")
+    p = terminal_counter_path(rr)
     try:
         if reset:
             if os.path.exists(p):
@@ -237,7 +240,8 @@ def claim(session, transcript=None):
     A done job is re-claimed only as a DELTA when its transcript grew by
     DELTA_LINES since extraction (sessions resumed after SessionEnd)."""
     os.makedirs(QUEUE_DIR, exist_ok=True)
-    fresh = {"status": "running", "ts": now(), "retries": 0, "deltas": 0}
+    fresh = {"status": "running", "ts": now(), "retries": 0, "deltas": 0,
+             "transcript": transcript or ""}
     try:
         with open(qpath(session), "x") as f:
             json.dump(fresh, f)
@@ -247,6 +251,8 @@ def claim(session, transcript=None):
     except OSError:
         return False, 0, 0
     old = read_rec(session)
+    if transcript and not old.get("transcript"):
+        old["transcript"] = transcript  # lets the sweep prune only dead records
     status = old.get("status")
     retries = int(old.get("retries") or 0)
     t = now()
@@ -259,8 +265,14 @@ def claim(session, transcript=None):
         write_rec(session, old)
         return True, int(old.get("since_line") or 0), int(old.get("deltas") or 0)
     if status == "done":
-        done_lines = int(old.get("lines_at_extract") or 0)
         cur = count_lines(transcript) if transcript else -1
+        if "lines_at_extract" not in old:
+            # pre-v4 record: the job is complete; growth counts only from now on
+            if cur >= 0:
+                old["lines_at_extract"] = cur
+                write_rec(session, old)
+            return False, 0, 0
+        done_lines = int(old.get("lines_at_extract") or 0)
         if not transcript or cur < 0 or cur - done_lines < DELTA_LINES:
             return False, 0, 0
         deltas = int(old.get("deltas") or 0) + 1
@@ -304,10 +316,19 @@ def resolve_bin():
     return ""
 
 
+_SESSION_VARS = {
+    "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "BH_HOOK_INPUT",
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+}
+
+
 def child_env():
-    env = {k: v for k, v in os.environ.items()
-           if not (k.startswith("CLAUDE_CODE_") or k in ("CLAUDECODE", "CLAUDE_PID",
-                                                           "CLAUDE_EFFORT", "BH_HOOK_INPUT"))}
+    # Drop only what binds a process to the parent session (sockets, ids);
+    # keep auth/provider settings such as CLAUDE_CODE_USE_BEDROCK or
+    # CLAUDE_CODE_OAUTH_TOKEN, or a teammate's extractor could never log in.
+    env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
     env["BH_LEARN_EXTRACT"] = "1"
     return env
 
@@ -338,7 +359,7 @@ def call_claude(b, flags, system_prompt, prompt, timeout=CALL_TIMEOUT):
         r = subprocess.run(argv, input=prompt, capture_output=True, text=True,
                            timeout=timeout, cwd=tempfile.gettempdir(), env=child_env())
     except subprocess.TimeoutExpired:
-        return 124, None, "timeout"
+        return 124, None, f"timeout after {timeout}s"
     except Exception as e:
         return 1, None, str(e)[:300]
     obj = None
@@ -357,12 +378,18 @@ def classify(rc, obj, err):
     """ok | deferred (try later, no retry burned) | terminal (config) | failed (retry)"""
     if obj and obj.get("subtype") == "success" and not obj.get("is_error") and rc == 0:
         return "ok"
-    text = (err or "") + " " + (json.dumps(obj)[:2000] if obj else "")
+    if rc == 124 or (err or "").startswith("timeout"):
+        return "deferred"  # a stalled network, not a configuration problem
+    parts = [err or ""]
+    if isinstance(obj, dict):
+        parts += [str(obj.get("result") or ""), str(obj.get("error") or ""),
+                  str(obj.get("subtype") or "")]
+    text = " ".join(parts)
     low = text.lower()
-    if any(s in low for s in ("usage limit", "rate limit", "rate_limit", "429", "529",
-                              "overloaded", "econnreset", "enotfound", "etimedout",
-                              "network", "fetch failed", "not logged in", "/login",
-                              "authentication", "unauthorized")):
+    if re.search(r"\b(429|529)\b", text) or any(s in low for s in (
+            "usage limit", "rate limit", "rate_limit", "overloaded", "econnreset",
+            "enotfound", "etimedout", "network", "fetch failed", "not logged in",
+            "/login", "authentication", "unauthorized")):
         return "deferred"
     if any(s in low for s in ("unknown option", "unrecognized", "invalid model",
                               "not_found_error", "model not found", "max_budget",
@@ -402,8 +429,9 @@ def resolve_flags(b, version, force=False):
                            "isolated": ctx < 15000, "cost_usd": obj.get("total_cost_usd")})
             break
         result.setdefault("errors", []).append({"ladder": name, "kind": kind, "err": err[:200]})
-        if kind == "deferred":
-            break  # not a flag problem — do not burn the ladder
+        if kind != "terminal":
+            result["deferred"] = True
+            break  # network/auth/crash: not a flag problem — do not burn the ladder
     try:
         os.makedirs(QUEUE_DIR, exist_ok=True)
         with open(caps_path(version), "w") as f:
@@ -471,41 +499,47 @@ def parse_fragment(result):
 
 def run_one(session, cwd, transcript, since_line=0, delta_n=0, from_hook=False):
     """One extraction; the ledger job is already claimed by the caller."""
-    if os.environ.get("BH_LEARN_DISABLE"):
-        finish(session, "skipped", reason="disabled")
-        return
     rr = rules_root(cwd)
     project = project_name(cwd)
+    skey = store_key(rr)
+
+    def fin(status, **kw):
+        finish(session, status, store=skey, **kw)
+
+    log(project, session, {"action": "launched", "delta": delta_n, "from_hook": from_hook})
+    if os.environ.get("BH_LEARN_DISABLE"):
+        fin("skipped", reason="disabled")
+        return
     if rr["scope"] == "repo":
         try:
             with open(os.path.join(rr["toplevel"], ".claude", "harness.json")) as f:
                 if json.load(f).get("learn") is False:
-                    finish(session, "skipped", reason="harness.json learn:false")
+                    fin("skipped", reason="harness.json learn:false")
                     return
         except Exception:
             pass
     if paused(rr):
-        finish(session, "paused", reason="store paused after terminal failures (re-run setup)")
+        fin("paused", reason="store paused after terminal failures (re-run setup)")
         log(project, session, {"action": "paused"})
         return
 
     lines = settle(transcript, max_wait=10 if from_hook else 30)
     if lines < 0:
-        finish(session, "skipped", reason="transcript unreadable")
+        fin("skipped", reason="transcript unreadable")
         log(project, session, {"action": "skipped", "reason": "no-transcript"})
         return
     if not os.environ.get("BH_LEARN_INCLUDE_HEADLESS") and not _digest.is_human_transcript(transcript):
-        finish(session, "skipped", reason="non-human session")
+        fin("skipped", reason="non-human session")
         log(project, session, {"action": "skipped", "reason": "non-human"})
         return
 
-    digest, info = _digest.build_digest(transcript, max_chars=DIGEST_MAX_CHARS, since_line=since_line)
+    digest, info = _digest.build_digest(transcript, max_bytes=DIGEST_MAX_BYTES, since_line=since_line)
     base = {"source_bytes": info["source_bytes"], "source_lines": info["source_lines"],
             "digest_chars": info["digest_chars"], "truncated": info["truncated"],
             "scrub_count": info["scrubbed"], "lines_at_extract": info["last_line"],
             "since_line": since_line, "deltas": delta_n, "typed_prompts": info["typed_prompts"]}
     if info["typed_prompts"] < MIN_PROMPTS or info["digest_chars"] < MIN_DIGEST_CHARS:
-        finish(session, "done", entries=0, reason="trivial", **base)
+        fin("done", entries=0, reason="trivial", **base)
         log(project, session, {"action": "done", "entries": 0, "reason": "trivial", **base})
         return
 
@@ -517,14 +551,14 @@ def run_one(session, cwd, transcript, since_line=0, delta_n=0, from_hook=False):
             with open(gi, "w") as f:
                 f.write("*\n")  # unreviewed machine output must never be committed
     except OSError:
-        finish(session, "failed", error="cannot create rules-pending dir", **base)
+        fin("failed", error="cannot create rules-pending dir", **base)
         log(project, session, {"action": "failed", "error": "pending-dir"})
         return
     try:
         with open(PROMPT_FILE) as f:
             system_prompt = f.read()
     except OSError:
-        finish(session, "terminal", error="prompt template missing", **base)
+        fin("terminal", error="prompt template missing", **base)
         log(project, session, {"action": "terminal", "error": "no-template"})
         return
 
@@ -542,14 +576,18 @@ def run_one(session, cwd, transcript, since_line=0, delta_n=0, from_hook=False):
 
     fake = os.environ.get("BH_LEARN_FAKE_ERROR")
     started = time.time()
-    with Lock(".run.lock", wait=180):
+    with Lock(".run.lock", wait=180) as lk:
+        if not lk.held:
+            fin("deferred", reason="run lock busy", **base)
+            log(project, session, {"action": "deferred", "reason": "run-lock"})
+            return
         if in_backoff() and not fake:
-            finish(session, "deferred", reason="backoff", **base)
+            fin("deferred", reason="backoff", **base)
             log(project, session, {"action": "deferred", "reason": "backoff"})
             return
         b = resolve_bin()
         if not b:
-            finish(session, "terminal", error="no claude binary found", **base)
+            fin("terminal", error="no claude binary found", **base)
             log(project, session, {"action": "terminal", "error": "no-binary"})
             return
         version = bin_version(b)
@@ -561,12 +599,12 @@ def run_one(session, cwd, transcript, since_line=0, delta_n=0, from_hook=False):
             caps = resolve_flags(b, version)
             if not caps.get("ok"):
                 errs = caps.get("errors") or []
-                if errs and errs[-1].get("kind") == "deferred":
+                if caps.get("deferred") or (errs and errs[-1].get("kind") != "terminal"):
                     set_backoff()
-                    finish(session, "deferred", reason="probe: " + errs[-1].get("err", "")[:120], **base)
+                    fin("deferred", reason="probe: " + errs[-1].get("err", "")[:120], **base)
                     log(project, session, {"action": "deferred", "reason": "probe-deferred"})
                     return
-                finish(session, "terminal", error="no working flag set: " + json.dumps(errs)[:300], **base)
+                fin("terminal", error="no working flag set: " + json.dumps(errs)[:300], **base)
                 bump_terminal(rr)
                 log(project, session, {"action": "terminal", "error": "no-flags"})
                 return
@@ -577,16 +615,16 @@ def run_one(session, cwd, transcript, since_line=0, delta_n=0, from_hook=False):
             "secs": secs, **base}
     if kind == "deferred":
         set_backoff()
-        finish(session, "deferred", error=err[:200], **meta)
+        fin("deferred", error=err[:200], **meta)
         log(project, session, {"action": "deferred", "error": err[:120], "secs": secs})
         return
     if kind == "terminal":
-        finish(session, "terminal", error=(err or json.dumps(obj or {}))[:200], **meta)
+        fin("terminal", error=(err or json.dumps(obj or {}))[:200], **meta)
         bump_terminal(rr)
         log(project, session, {"action": "terminal", "error": (err or "")[:120], "secs": secs})
         return
     if kind == "failed":
-        finish(session, "failed", error=(err or f"exit {rc}")[:200], **meta)
+        fin("failed", error=(err or f"exit {rc}")[:200], **meta)
         log(project, session, {"action": "failed", "error": (err or f"exit {rc}")[:120], "secs": secs})
         return
     bump_terminal(rr, reset=True)
@@ -600,7 +638,7 @@ def run_one(session, cwd, transcript, since_line=0, delta_n=0, from_hook=False):
     meta["dropped_low"] = dropped
     meta["contract"] = contract
     if contract != "text":
-        finish(session, "done", entries=0, **meta)
+        fin("done", entries=0, **meta)
         log(project, session, {"action": "done", "entries": 0, **{k: meta[k] for k in
             ("contract", "cost_usd", "secs", "claude_version", "ladder", "digest_chars")}})
         return
@@ -617,10 +655,10 @@ def run_one(session, cwd, transcript, since_line=0, delta_n=0, from_hook=False):
             f.write(head + text + "\n")
         os.replace(tmp, os.path.join(pending_dir, name))  # atomic: never a half-written fragment
     except OSError as e:
-        finish(session, "failed", error=str(e)[:200], **meta)
+        fin("failed", error=str(e)[:200], **meta)
         log(project, session, {"action": "failed", "error": "write"})
         return
-    finish(session, "done", entries=entries, fragment=os.path.join(pending_dir, name), **meta)
+    fin("done", entries=entries, fragment=os.path.join(pending_dir, name), **meta)
     log(project, session, {"action": "done", "entries": entries, **{k: meta[k] for k in
         ("contract", "cost_usd", "secs", "claude_version", "ladder", "digest_chars", "num_turns")}})
 
@@ -637,9 +675,16 @@ def sweep(cwd, tdir, exclude):
         t = now()
         # prune ledger records older than the transcript retention
         for p in glob.glob(os.path.join(QUEUE_DIR, "*.json")):
+            if os.path.basename(p).startswith("caps-"):
+                continue
             try:
                 rec = json.load(open(p))
-                if rec.get("status") in ("done", "skipped") and t - int(rec.get("ts") or t) > PRUNE_DAYS * 86400:
+                age = t - int(rec.get("ts") or t)
+                tr = rec.get("transcript")
+                gone = bool(tr) and not os.path.exists(tr)
+                # a record outlives its transcript only briefly; a pre-v4 record
+                # (no transcript path) ages out after the retention window
+                if (gone and age > 86400) or (not tr and age > PRUNE_DAYS * 86400):
                     os.remove(p)
             except Exception:
                 continue
@@ -712,7 +757,7 @@ if ARGS and ARGS[0] == "--dry-run" and len(ARGS) >= 2:
         print(json.dumps({"error": f"no such transcript: {path}"}))
         sys.exit(1)
     cwd = ARGS[2] if len(ARGS) > 2 else os.getcwd()
-    digest, info = _digest.build_digest(path, max_chars=DIGEST_MAX_CHARS)
+    digest, info = _digest.build_digest(path, max_bytes=DIGEST_MAX_BYTES)
     rr = rules_root(cwd)
     b = resolve_bin()
     print(json.dumps({"transcript": path, "human": _digest.is_human_transcript(path),
@@ -737,17 +782,13 @@ try:
     if not session:
         sys.exit(0)
     if not transcript or not os.path.exists(transcript):
-        log(os.path.basename(cwd), session, {"action": "skipped", "reason": "no-transcript",
-                                             "end_reason": data.get("reason")})
-        sys.exit(0)
+        sys.exit(0)  # nothing to extract; the sweep finds a late-written transcript
     ok, since, dn = claim(session, transcript)
     if not ok:
         sys.exit(0)
     rec = read_rec(session)
     rec["end_reason"] = data.get("reason")
-    write_rec(session, rec)
-    log(os.path.basename(cwd), session, {"action": "launched", "end_reason": data.get("reason"),
-                                         "delta": dn})
+    write_rec(session, rec)  # the runner logs the outcome (project name needs git)
     spawn_detached(["--run", session, cwd, transcript, str(since), str(dn), "hook"])
 except SystemExit:
     raise

@@ -292,9 +292,10 @@ Properties, in order of importance:
   pinned model id, a dollar cap and an effort of `low`; its real cost and token
   usage are recorded in the ledger and metrics.
 - **SessionEnd is only the fast path — the sweep is the guarantee.** Kill the
-  terminal mid-session and the next startup in that folder still captures it
-  (oldest first, bounded, one sweep at a time, within Claude Code's 30-day
-  transcript retention; a folder you never reopen is not swept).
+  terminal mid-session and a later startup in that folder still captures it,
+  once the transcript has been idle for two hours (oldest first, bounded, one
+  sweep at a time, within Claude Code's 30-day transcript retention; a folder
+  you never reopen is not swept).
 - **Resumed sessions are re-extracted as a delta** (only the new transcript
   lines), so already-reviewed items are not resubmitted.
 - **Failures are classified.** Usage limits and network errors defer the job
@@ -314,9 +315,10 @@ Properties, in order of importance:
   session, so two sessions never review the same file. Non-git stores keep a
   `.bak` of rules.md from before each review.
 - **Human sessions only.** The harness's own headless runs and your `claude -p`
-  scripts are neither extracted nor counted in metrics
-  (`BH_LEARN_INCLUDE_HEADLESS=1` to include them; `BH_LEARN_DISABLE=1` or
-  `{"learn": false}` in `.claude/harness.json` to switch the loop off).
+  scripts are neither extracted nor counted in metrics, and a headless session
+  gets the rules injected but never the review ceremony
+  (`BH_LEARN_INCLUDE_HEADLESS=1` to extract them anyway; `BH_LEARN_DISABLE=1`
+  or `{"learn": false}` in `.claude/harness.json` to switch the loop off).
 
 Division of labor, no overlap: `CLAUDE.md` is the human-curated static guide
 (what the project is, how to run it); `.claude/rules.md` is the
@@ -340,8 +342,8 @@ tools; symlink it to CLAUDE.md in that case.
   version, then PATH) and the cached flag probe with its context size.
 - `bin/harness-stats --since 30` is the long-term view: extractor yield and
   cost per run, and per session the first-turn prompt size and the bytes of
-  user-level rules Claude Code loaded (`rulesKB` — the global-rules tax, 0
-  after migration). Inside Claude Code, `/context` lists what was loaded and
+  user-level instructions Claude Code loaded (`rulesKB`: `~/.claude/rules`
+  plus `~/.claude/CLAUDE.md` — the global-rules tax, near 0 after migration). Inside Claude Code, `/context` lists what was loaded and
   `/usage` shows the prompt-cache footprint.
 
 ## Metrics (personal, local — never transmitted)

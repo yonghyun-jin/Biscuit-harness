@@ -44,8 +44,14 @@ _SECRETS = [
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"\b[A-Za-z0-9]{3}8Q~[A-Za-z0-9._~-]{20,}"),  # Entra client secret shape
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
-    re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*['\"]?[A-Za-z0-9+/=_~.-]{12,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),            # OpenAI-style incl. sk-proj-
+    re.compile(r"\blin_api_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"(?i)accountkey=[A-Za-z0-9+/=]{20,}"),     # Azure storage
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}"),
+    re.compile(r"(?i)(^|\s)-u\s+['\"]?[^\s:'\"]+:[^\s'\"]+"),  # curl -u user:pass
+    re.compile(r"(?i)\b(pw|password|passwd|secret|token|api[_-]?key)\s*[=:]\s*['\"]?\S{8,}"),
 ]
 
 
@@ -98,7 +104,8 @@ def is_typed_prompt(o):
         return False
     ps = o.get("promptSource")
     if ps is not None:
-        return ps == "typed"
+        # human sources seen in real transcripts; "system"/"sdk" are not
+        return ps in ("typed", "queued", "suggestion_accepted")
     # Older CLIs have no promptSource: a non-meta string message is a prompt.
     m = o.get("message") or {}
     c = m.get("content")
@@ -126,7 +133,7 @@ def _tool_summary(block):
     return f"[tool {name}]"
 
 
-def build_digest(path, max_chars=200_000, since_line=0, keep_tail=12,
+def build_digest(path, max_bytes=200_000, since_line=0, keep_tail=12,
                  user_cap=4_000, old_assistant_cap=500, error_cap=300):
     """Compact conversation text for the extractor.
 
@@ -180,8 +187,6 @@ def build_digest(path, max_chars=200_000, since_line=0, keep_tail=12,
             if key in seen_assistant:
                 continue
             seen_assistant.add(key)
-            if mid and mid not in {k[0] for k in seen_assistant if k[0] != mid}:
-                pass
             for b in _blocks(m.get("content")):
                 bt = b.get("type")
                 if bt == "text":
@@ -195,10 +200,11 @@ def build_digest(path, max_chars=200_000, since_line=0, keep_tail=12,
     info["source_lines"] = last_line + 1
     info["last_line"] = last_line + 1
 
-    # --- budget ---
+    # --- budget (UTF-8 bytes: CJK text costs more tokens per character) ---
     def total():
-        return sum(len(x[1]) for x in items) + 12 * len(items)
+        return sum(len(x[1].encode("utf-8", "replace")) for x in items) + 12 * len(items)
 
+    max_chars = max_bytes
     if total() > max_chars:
         info["truncated"] = True
         items = [(k, (v[:user_cap] + " […]") if k == "user" and len(v) > user_cap else v)

@@ -327,6 +327,50 @@ text, info = _digest.build_digest(tS)
 check("T13 digest redacts a planted live key", "sk_live_" not in text and info["scrubbed"] >= 1, f"scrubbed={info['scrubbed']}")
 check("T13 digest keeps the typed prompts and the failed tool result", info["typed_prompts"] == 3 and "[tool error]" in text)
 
+# ---------------------------------------------------------------- T15 pre-v4 ledger records are complete
+sV = "vvvvvvvv-1111-2222-3333-444444444444"
+tV = make_transcript(os.path.join(dirA, sV + ".jsonl"), repoA, sV, prompts=4)
+set_ledger(sV, {"status": "done", "ts": int(time.time()) - 5000, "retries": 0, "entries": 3})  # v3 shape
+hook("learn-extract.sh", {"session_id": sV, "cwd": repoA, "transcript_path": tV}, env=env_with(BH_LEARN_FAKE_ERROR="crash"))
+rec = ledger(sV)
+check("T15 a pre-v4 done record (no lines_at_extract) is NOT re-extracted; it is stamped instead",
+      rec.get("status") == "done" and rec.get("lines_at_extract") == sum(1 for _ in open(tV)) and rec.get("transcript") == tV, json.dumps(rec)[:200])
+
+# ---------------------------------------------------------------- T16 per-store keys differ between repos
+kA = _project_name.store_key(_project_name.rules_root(repoA))
+kB = _project_name.store_key(_project_name.rules_root(repoB))
+check("T16 two repos get different store keys (pause counters are per store)", kA != kB and kA.startswith("repoA-"), f"{kA} {kB}")
+check("T16 the home directory never gets a native file under ~/.claude/rules", _project_name.rules_root(HOME)["native"] == "")
+
+# ---------------------------------------------------------------- T17 queued prompts are human prompts
+sQ = "qqqqqqqq-1111-2222-3333-444444444444"
+tQ = make_transcript(os.path.join(dirA, sQ + ".jsonl"), repoA, sQ, prompts=2)
+with open(tQ, "a") as f:
+    f.write(json.dumps({"type": "user", "promptSource": "queued", "entrypoint": "cli", "cwd": repoA, "sessionId": sQ,
+                        "message": {"role": "user", "content": "no — the healthcheck is /healthz, update the runbook too. " * 5}},
+                       separators=(",", ":")) + "\n")
+text, info = _digest.build_digest(tQ)
+check("T17 a prompt typed while the model was working (promptSource=queued) reaches the digest", info["typed_prompts"] == 3 and "update the runbook" in text, str(info["typed_prompts"]))
+
+# ---------------------------------------------------------------- T18 timeout is deferred, not terminal
+sO = "oooooooo-1111-2222-3333-444444444444"
+tO = make_transcript(os.path.join(dirA, sO + ".jsonl"), repoA, sO)
+run([os.path.join(HOOKS, "learn-extract.sh"), "--run", sO, repoA, tO, "0", "0"], env=env_with(BH_LEARN_FAKE_ERROR="timeout after 300s"))
+check("T18 a timed-out call is deferred (backoff), never a terminal strike", ledger(sO).get("status") == "deferred" and ledger(sO).get("deferrals") == 1, json.dumps(ledger(sO))[:160])
+check("T18 the pause counter was not touched by the timeout", not os.path.exists(os.path.join(HOME, ".claude", "learn-queue", f".terminal-{kA}")))
+
+# ---------------------------------------------------------------- T19 headless sessions get rules but no ceremony
+open(os.path.join(pend, "h1.md"), "w").write("# Rules\n- candidate\n")
+rh = hook("learn-recall.sh", {"session_id": "sess-headless-9999", "cwd": repoA, "transcript_path": tA, "source": "startup"},
+          env=env_with(BH_LEARN_FAKE_ERROR="crash", CLAUDE_CODE_ENTRYPOINT="sdk-cli"))
+check("T19 a headless session is injected the rules but claims nothing and gets no card",
+      "<project-rules" in rh.stdout and "<rules-pending" not in rh.stdout and os.path.exists(os.path.join(pend, "h1.md")), rh.stdout[:160])
+os.remove(os.path.join(pend, "h1.md"))
+
+# ---------------------------------------------------------------- T20 secrets the user actually handles
+s2, n2 = _digest.scrub_secrets("az storage blob upload --account-key AccountKey=abcDEFghiJKLmnoPQRstuVWXyz0123456789== ; curl -H 'Authorization: Bearer eyJabcdefghijklmnopqrstuvwxyz0123456789' ; export GH=github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ ; sk-proj-abcdefghijklmnopqrstuvwxyz ; PW: hunter2hunter2 ; curl -u admin:S3cretPass host")
+check("T20 AccountKey / Bearer / github_pat / sk-proj / PW: / curl -u are redacted", n2 >= 6 and "hunter2" not in s2 and "S3cretPass" not in s2 and "AccountKey=abc" not in s2, f"n={n2} {s2[:200]}")
+
 # ---------------------------------------------------------------- T14 live (optional)
 if LIVE:
     if not REAL_BIN:
@@ -336,6 +380,7 @@ if LIVE:
         live_env["BH_LEARN_NO_SPAWN"] = "1"
         live_env["BH_CLAUDE_BIN"] = REAL_BIN
         live_env["HOME"] = REAL_HOME
+        live_env["BH_METRICS_DIR"] = os.path.join(HOME, ".claude", "metrics")  # keep real metrics clean
         sid = f"learn-test-live-{uuid.uuid4().hex[:8]}"
         repoL = os.path.join(TMP, "repoL"); os.makedirs(repoL); subprocess.run(["git", "-C", repoL, "init", "-q"], check=True)
         tL2 = make_transcript(os.path.join(TMP, sid + ".jsonl"), repoL, sid)

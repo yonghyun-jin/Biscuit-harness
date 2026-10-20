@@ -31,6 +31,8 @@ if [ "$MODE" = "check" ]; then
   python3 - "$HARNESS_DIR" "$CLAUDE_DIR/settings.json" <<'PY'
 import json, os, sys
 harness, path = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(harness, "hooks"))
+from _project_name import ledger_status_counts, looks_like_harness_rules
 try:
     hooks = json.load(open(path)).get("hooks", {})
 except Exception:
@@ -44,26 +46,20 @@ for ev, entries in hooks.items():
                 extra = f" timeout={h['timeout']}" if "timeout" in h else ""
                 print(f"  {ev:<13} {cmd.rsplit('/', 1)[-1]}{extra}" + (f" matcher={e['matcher']}" if e.get("matcher") else ""))
 legacy = os.path.join(os.path.dirname(path), "rules")
+n = 0
 try:
-    n = sum(1 for f in os.listdir(legacy) if f.endswith(".md"))
-except OSError:
-    n = 0
-print(f"legacy ~/.claude/rules/*.md files (loaded into EVERY project by Claude Code): {n}")
-q = os.path.join(os.path.dirname(path), "learn-queue")
-st = {}
-try:
-    for f in os.listdir(q):
-        if f.endswith(".json") and not f.startswith("caps-"):
+    for f in os.listdir(legacy):
+        if f.endswith(".md"):
             try:
-                s = json.load(open(os.path.join(q, f))).get("status")
-                st[s] = st.get(s, 0) + 1
-            except Exception:
+                n += looks_like_harness_rules(open(os.path.join(legacy, f)).read())
+            except OSError:
                 pass
 except OSError:
     pass
-print("learn-queue:", json.dumps(st))
+print(f"legacy harness-style ~/.claude/rules/*.md files (loaded into EVERY project by Claude Code): {n}")
+print("learn-queue:", json.dumps(ledger_status_counts()))
 PY
-  echo "extractor probe (one tiny headless call):"
+  echo "extractor probe (cached per binary version; 'hooks/learn-extract.sh --probe --force' makes a fresh call):"
   "$HARNESS_DIR/hooks/learn-extract.sh" --probe 2>&1 | sed 's/^/  /'
   exit 0
 fi
@@ -144,10 +140,7 @@ def ensure_hook(event, matcher, command, timeout=None):
                 if timeout is not None and h.get("timeout") != timeout:
                     h["timeout"] = timeout
                     changed = True
-                if timeout is None and "timeout" in h:
-                    del h["timeout"]
-                    changed = True
-                return changed
+                return changed  # a timeout the harness did not write is left alone
     hook = {"type": "command", "command": command}
     if timeout is not None:
         hook["timeout"] = timeout
@@ -217,14 +210,27 @@ for a in added:
 if not added:
     print("  = settings.json already up to date")
 
-# Re-arm extraction stores paused after repeated configuration errors.
+# Re-arm extraction after configuration errors: clear the pause counters and
+# let terminal jobs be retried once (the configuration presumably changed).
+sys.path.insert(0, os.path.join(harness, "hooks"))
+from _project_name import QUEUE_DIR, looks_like_harness_rules
 claude_dir = os.path.dirname(path)
-q = os.path.join(claude_dir, "learn-queue")
 try:
-    for f in os.listdir(q):
+    for f in os.listdir(QUEUE_DIR):
+        p = os.path.join(QUEUE_DIR, f)
         if f.startswith(".terminal-"):
-            os.remove(os.path.join(q, f))
+            os.remove(p)
             print("  + re-armed paused extraction store")
+        elif f.endswith(".json") and not f.startswith("caps-"):
+            try:
+                rec = json.load(open(p))
+                if rec.get("status") == "terminal":
+                    rec.update({"status": "failed", "retries": 0, "rearmed": True})
+                    with open(p, "w") as fh:
+                        json.dump(rec, fh)
+                    print(f"  + re-armed terminal extraction job {f}")
+            except Exception:
+                pass
 except OSError:
     pass
 
@@ -232,14 +238,12 @@ except OSError:
 # Code into EVERY project on this machine. Notice only — moving the user's
 # memory is never automatic.
 legacy = os.path.join(claude_dir, "rules")
-shape = re.compile(r"^(# Rules\b|# Episodes\b|## \d{4}-\d\d-\d\d\s)", re.M)
 n = 0
 try:
     for f in os.listdir(legacy):
         if f.endswith(".md"):
             try:
-                if shape.search(open(os.path.join(legacy, f)).read()):
-                    n += 1
+                n += looks_like_harness_rules(open(os.path.join(legacy, f)).read())
             except OSError:
                 pass
 except OSError:

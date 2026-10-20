@@ -19,6 +19,9 @@ import re
 import subprocess
 
 LEARN_ROOT = os.path.expanduser("~/.claude/learn-rules")
+QUEUE_DIR = os.path.expanduser("~/.claude/learn-queue")  # extraction ledger
+MAX_RETRIES = 2       # runner crashes only; usage limits defer, config errors are terminal
+TERMINAL_PAUSE = 3    # consecutive terminal failures that pause a store (setup re-arms)
 UNCLAIMED_DIR = os.path.join(LEARN_ROOT, "_unclaimed")
 LEGACY_RULES_DIR = os.path.expanduser("~/.claude/rules")  # native, global — read-only for us
 NATIVE_RULES_FILE = "biscuit-rules.md"  # <repo>/.claude/rules/<this> = native opt-in
@@ -103,8 +106,15 @@ def rules_root(cwd):
         "pending": os.path.join(root, "rules-pending"),
         # Claude Code loads <cwd>/.claude/rules/*.md natively for any folder,
         # git or not — the same opt-in works here (no hook size cap).
-        "native": os.path.join(cwd, ".claude", "rules", NATIVE_RULES_FILE),
+        "native": _native_for(cwd),
     }
+
+
+def _native_for(cwd):
+    d = os.path.join(cwd, ".claude", "rules")
+    if os.path.realpath(d) == os.path.realpath(LEGACY_RULES_DIR):
+        return ""  # cwd is $HOME: that directory is the global one we must never use
+    return os.path.join(d, NATIVE_RULES_FILE)
 
 
 def legacy_rules_path(cwd):
@@ -122,5 +132,34 @@ def looks_like_harness_rules(text):
 
 
 def store_key(rr):
-    """Short key for per-store state files (terminal-failure counter etc.)."""
-    return safe_name(os.path.basename(rr["root"].rstrip("/")) + "-" + rr["scope"])
+    """Per-store key for state files (terminal-failure counter etc.): the
+    folder's name plus a hash of the review queue's real location, so two
+    repos (or two same-named folders) never share state."""
+    base = rr.get("toplevel") or rr["root"]
+    anchor = os.path.dirname(rr["pending"])
+    h = hashlib.sha1(os.path.realpath(anchor).encode("utf-8", "replace")).hexdigest()[:8]
+    return safe_name(os.path.basename(base.rstrip("/")) or "root") + "-" + h
+
+
+def terminal_counter_path(rr):
+    return os.path.join(QUEUE_DIR, f".terminal-{store_key(rr)}")
+
+
+def ledger_status_counts():
+    """{status: count} over the extraction ledger (probe caches excluded)."""
+    import json
+    counts = {}
+    try:
+        names = os.listdir(QUEUE_DIR)
+    except OSError:
+        return counts
+    for f in names:
+        if not f.endswith(".json") or f.startswith("caps-"):
+            continue
+        try:
+            with open(os.path.join(QUEUE_DIR, f)) as fh:
+                st = json.load(fh).get("status")
+        except Exception:
+            continue
+        counts[st] = counts.get(st, 0) + 1
+    return counts

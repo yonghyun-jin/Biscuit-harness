@@ -161,6 +161,10 @@ def main():
         folders = [c for c in find_folders(name, home) if not is_git(c)]
         # prefer a folder with transcripts (recent first)
         folders.sort(key=lambda c: cwds.get(c, 0), reverse=True)
+        if len(folders) > 1 and not any(cwds.get(c) for c in folders):
+            rows.append((f, len(text), "move", os.path.join(UNCLAIMED_DIR, f),
+                         f"{len(folders)} same-named folders, none with a session — attached on first use"))
+            continue
         if folders:
             target = os.path.join(store_dir(folders[0]), "rules.md")
             note = f"{folders[0]}" + (f" (+{len(folders) - 1} other same-named folder(s))" if len(folders) > 1 else "")

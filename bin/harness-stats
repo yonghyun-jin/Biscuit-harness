@@ -15,10 +15,12 @@ import argparse
 import json
 import os
 import statistics
+import sys
 from datetime import datetime, timedelta, timezone
 
-METRICS_DIR = os.path.expanduser("~/.claude/metrics")
-QUEUE_DIR = os.path.expanduser("~/.claude/learn-queue")
+METRICS_DIR = os.environ.get("BH_METRICS_DIR") or os.path.expanduser("~/.claude/metrics")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
+from _project_name import ledger_status_counts  # noqa: E402
 
 
 def read_jsonl(name):
@@ -123,18 +125,7 @@ def main():
                   f"median {med(secs):.0f}s; median digest {fmt_k(med(dig))} chars")
             if vers:
                 print(f"  claude versions:    {', '.join(str(v) for v in vers)}")
-        # ledger snapshot
-        st = {}
-        try:
-            for f in os.listdir(QUEUE_DIR):
-                if f.endswith(".json") and not f.startswith("caps-"):
-                    try:
-                        s = json.load(open(os.path.join(QUEUE_DIR, f))).get("status")
-                        st[s] = st.get(s, 0) + 1
-                    except Exception:
-                        pass
-        except OSError:
-            pass
+        st = ledger_status_counts()
         if st:
             print("  ledger now:         " + ", ".join(f"{k} {v}" for k, v in sorted(st.items(), key=lambda kv: str(kv[0]))))
 
@@ -167,8 +158,9 @@ def main():
         skills = sum(r.get("harness_skill_uses") or 0 for r in rows)
         print(f"  {g:<12} {n:>8} {int(dur // 60):>5}m {msgs:>8.0f} {calls:>6.0f} "
               f"{friction:>9} {ctx:>8} {rules_kb:>8} {skills:>7}")
-    print("  ctx@1st = median first-turn prompt tokens; rulesKB = median user-level rules bytes "
-          "Claude Code loaded (the ~/.claude/rules tax; 0 after migration). Rows before v4 lack both.")
+    print("  ctx@1st = median first-turn prompt tokens; rulesKB = median bytes of user-level "
+          "instructions Claude Code loaded (~/.claude/rules + ~/.claude/CLAUDE.md; near 0 after "
+          "migration). Rows before v4 lack both.")
 
 
 if __name__ == "__main__":

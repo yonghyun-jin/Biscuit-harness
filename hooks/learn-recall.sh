@@ -38,7 +38,8 @@ import glob, json, os, re, shutil, subprocess, sys, time
 HOOK_DIR = sys.argv[1]
 sys.path.insert(0, HOOK_DIR)
 from _project_name import (project_name, rules_root, legacy_rules_path,
-                           looks_like_harness_rules, store_key, UNCLAIMED_DIR)
+                           looks_like_harness_rules, store_key, terminal_counter_path,
+                           UNCLAIMED_DIR, LEARN_ROOT, QUEUE_DIR, MAX_RETRIES, TERMINAL_PAUSE)
 
 try:
     data = json.loads(os.environ.get("BH_HOOK_INPUT") or "{}")
@@ -50,7 +51,6 @@ FULL_TEXT_MAX = 1500     # small files are injected whole
 RULES_TRIGGER, RULES_TARGET = 24, 14        # top-level bullets (hysteresis)
 RULES_BYTES_TRIGGER, RULES_BYTES_TARGET = 7000, 4000
 CLAIM_TTL = 3600
-QUEUE_DIR = os.path.expanduser("~/.claude/learn-queue")
 HARNESS = os.path.dirname(HOOK_DIR)
 
 source = data.get("source") or "startup"
@@ -61,6 +61,10 @@ session = re.sub(r"[^A-Za-z0-9._-]", "_", data.get("session_id") or "s")
 name = project_name(cwd)
 rr = rules_root(cwd)
 full = source in ("startup", "resume", "clear")
+# A headless run (`claude -p` loads hooks too) gets rules + index but never the
+# ceremony: nobody reads a review card there, and it must not claim fragments.
+if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli") != "cli":
+    full = False
 
 
 def nbytes(s):
@@ -85,6 +89,8 @@ if rr["scope"] == "local" and not os.path.isfile(rr["rules"]):
         if os.path.isfile(cand):
             os.makedirs(rr["root"], exist_ok=True)
             os.replace(cand, rr["rules"])
+            with open(os.path.join(LEARN_ROOT, "MIGRATED.md"), "a") as mf:
+                mf.write(f"- {time.strftime('%Y-%m-%d %H:%M:%S')}  {cand}  →  {rr['rules']} (attached by learn-recall)\n")
             card_notes.append(f"attached the migrated legacy rules file to this folder's store ({rr['root']})")
     except OSError:
         pass
@@ -127,7 +133,7 @@ if full:
                             os.replace(p, target)  # ours again, or a stale claim: re-queue
                             frags.append(target)
                         except OSError:
-                            frags.append(p)
+                            continue  # someone else just took it
                     continue
                 if f.endswith(".md") and not f.startswith("."):
                     frags.append(p)
@@ -140,12 +146,16 @@ if full:
                     os.utime(dst, None)
                     claimed.append(dst)
                 except OSError:
-                    claimed.append(p)
+                    continue  # claimed by a concurrent session a moment ago
             frags = claimed
         if frags:
             if rr["scope"] == "local" and os.path.isfile(rr["rules"]):
+                # undo outside git: timestamped copies, newest three kept
                 try:
-                    shutil.copyfile(rr["rules"], rr["rules"] + ".bak")
+                    shutil.copyfile(rr["rules"], rr["rules"] + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+                    baks = sorted(glob.glob(rr["rules"] + ".bak-*"))
+                    for b in baks[:-3]:
+                        os.remove(b)
                 except OSError:
                     pass
             native = os.path.isfile(rr["native"]) if rr["native"] else False
@@ -180,27 +190,35 @@ if full:
                 "Files:\n" + "\n".join(f"  {p}" for p in frags) + "\n"
                 + ("".join(f"Note: {n}\n" for n in card_notes))
                 + "</rules-pending>")))
-        elif card_notes:
-            sections.append((0, "<rules-note>" + "; ".join(card_notes) + "</rules-note>"))
 
-        # failures that must never be invisible
-        terminal, running = [], 0
+        # failures that must never be invisible — this store's jobs only
+        # (pre-v4 records carry no store: only their terminal ones are shown)
+        skey = store_key(rr)
+        terminal, running, stuck = [], 0, []
         for qf in glob.glob(os.path.join(QUEUE_DIR, "*.json")):
+            if os.path.basename(qf).startswith("caps-"):
+                continue
             try:
                 with open(qf) as f:
                     rec = json.load(f)
                 if not isinstance(rec, dict):
                     continue
                 st = rec.get("status")
-                if st == "terminal" or (st == "failed" and int(rec.get("retries") or 0) >= 2):
+                mine = rec.get("store") == skey or (not rec.get("store") and st == "terminal")
+                if not mine:
+                    continue
+                if st == "terminal" or (st == "failed" and int(rec.get("retries") or 0) >= MAX_RETRIES):
                     terminal.append((os.path.basename(qf), str(rec.get("error") or "")[:100]))
                 elif st == "running" and time.time() - int(rec.get("ts") or 0) < 60:
                     running += 1
+                elif st == "deferred" and (int(rec.get("deferrals") or 0) >= 6 or
+                                           time.time() - int(rec.get("deferred_since") or time.time()) > 86400):
+                    stuck.append((os.path.basename(qf), str(rec.get("error") or rec.get("reason") or "")[:100]))
             except Exception:
                 continue
         try:
-            with open(os.path.join(QUEUE_DIR, f".terminal-{store_key(rr)}")) as f:
-                paused = int(f.read().strip() or 0) >= 3
+            with open(terminal_counter_path(rr)) as f:
+                paused = int(f.read().strip() or 0) >= TERMINAL_PAUSE
         except Exception:
             paused = False
         if terminal or paused:
@@ -213,6 +231,13 @@ if full:
                 + ". Mention this to the user once (one line); deleting a job's .json re-arms it "
                 f"and re-running `{HARNESS}/setup` clears the pause.\n"
                 + "\n".join(lines) + "\n</rules-extract-warning>")))
+        if stuck:
+            sections.append((1, (
+                f"<rules-extract-warning>{len(stuck)} extraction job(s) for this folder keep being "
+                "deferred (usage limit, network or login problem for the headless `claude`). "
+                "Mention it to the user once, in one line; `hooks/learn-extract.sh --probe --force` "
+                "shows the exact error.\n" + "\n".join(f"{a}: {b}" for a, b in stuck[:3])
+                + "\n</rules-extract-warning>")))
         if running:
             sections.append((1, f"<rules-note>{running} extraction(s) from the previous session "
                                 "still running; their review card comes next session.</rules-note>"))
@@ -231,6 +256,9 @@ if full:
                 stdin=subprocess.DEVNULL, start_new_session=True, env=env)
     except Exception:
         pass  # the rules injection below must never be blocked by the loop
+
+if card_notes and not any("<rules-pending" in x for _, x in sections):
+    sections.append((0, "<rules-note>" + "; ".join(card_notes) + "</rules-note>"))
 
 # ---- the rules file
 path = rr["rules"]
@@ -273,10 +301,13 @@ def rules_cap(t):
 
 
 def bullet_chunks(t):
-    """Split the rules text into chunks that start at top-level bullets."""
-    chunks, cur = [], []
+    """Split the rules text into chunks that start at top-level bullets
+    (same fence rule as top_bullets: a '- ' inside ``` is not a bullet)."""
+    chunks, cur, fenced = [], [], False
     for ln in t.splitlines():
-        if ln.startswith("- ") and cur:
+        if ln.lstrip().startswith("```"):
+            fenced = not fenced
+        if ln.startswith("- ") and cur and not fenced:
             chunks.append("\n".join(cur))
             cur = []
         cur.append(ln)
@@ -310,8 +341,9 @@ if text or native:
                 "card) a 'consolidated N->M' line plus one line per fold/demotion/drop, ending with the "
                 "veto note. If bullets cannot be folded without losing load-bearing constraints, keep "
                 "them and flag the overflow as [your call]; if the user opts to keep the larger "
-                'section, add "<!-- bh:rules-cap <N> -->" right below the # Rules heading, or move the '
-                f"# Rules tier into {rr['native']} (loaded natively by Claude Code, no size cap).\n"
+                'section, add "<!-- bh:rules-cap <N> -->" right below the # Rules heading'
+                + (f", or move the # Rules tier into {rr['native']} (loaded natively by Claude "
+                   "Code, no size cap)" if rr["native"] else "") + ".\n"
                 "</rules-consolidation>")))
 
     index_text = ""
@@ -361,16 +393,20 @@ if text or native:
         n_heads -= 1
         out = assemble(n_chunks, n_heads)
     truncated = n_chunks < len(chunks) or n_heads < len(headings)
-    log_event("learn-recall", {"rules_count": n_rules, "episodes_count": len(headings),
-                               "source": rr["scope"], "start": source, "native": native,
-                               "out_bytes": nbytes(out), "truncated": truncated})
 else:
     out = "\n".join(x for _, x in sorted(sections, key=lambda x: x[0]))
+    n_rules, headings, native, truncated = 0, [], False, False
 
 
+hard_cut = False
 if nbytes(out) > BUDGET + 400:
     # last resort — never let the cap turn the whole output into a preview
     out = out.encode("utf-8")[:BUDGET].decode("utf-8", "ignore") + "\n[hook output hard-truncated]"
+    hard_cut = truncated = True
+if text or native:
+    log_event("learn-recall", {"rules_count": n_rules, "episodes_count": len(headings),
+                               "source": rr["scope"], "start": source, "native": native,
+                               "out_bytes": nbytes(out), "truncated": truncated, "hard_cut": hard_cut})
 if out.strip():
     print(out)
 PY

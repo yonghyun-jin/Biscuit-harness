@@ -22,7 +22,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-METRICS_DIR = os.path.expanduser("~/.claude/metrics")
+METRICS_DIR = os.environ.get("BH_METRICS_DIR") or os.path.expanduser("~/.claude/metrics")
 MAX_BYTES = 5 * 1024 * 1024
 
 _version_cache = None
